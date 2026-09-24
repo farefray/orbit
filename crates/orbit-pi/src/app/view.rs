@@ -1125,13 +1125,17 @@ impl Render for OrbitApp {
             // opened by the download control and Check for Updates. Below the
             // extension dialog (a run blocks on it) and the lightbox.
             .children(self.updater_dialog_layer(window, cx))
-            // ── image lightbox — full-window, above everything; opened from a
-            // transcript image tile, dismissed by click or Escape.
+            // ── image lightbox — full-window, above every workbench surface;
+            // opened from a transcript image tile and dismissed by click or
+            // Escape. The quit safeguard below still takes precedence.
             .children(
                 self.lightbox
                     .clone()
                     .map(|image| self.lightbox_layer(image, cx)),
             )
+            // ── quit confirmation — always topmost among interactive layers
+            // so an OS-caption close cannot be hidden behind another modal.
+            .children(self.quit_confirmation_layer(window, cx))
             // ── toasts — the in-app stack, topmost so a notification is
             // never buried by whatever surface happens to be open.
             .children(self.toast_layer(cx))
@@ -1207,6 +1211,7 @@ impl Render for OrbitApp {
                         .update(cx, |panel, cx| panel.set_height(height, cx));
                 },
             ))
+            .on_action(cx.listener(Self::on_quit))
             .on_action(cx.listener(Self::on_submit))
             .on_action(cx.listener(Self::on_steer))
             .on_action(cx.listener(Self::on_autocomplete_accept))

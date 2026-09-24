@@ -140,6 +140,8 @@ actions!(
     orbit_keys,
     [
         Quit,
+        QuitDialogCancel,
+        QuitDialogConfirm,
         AbortRun,
         NewSession,
         RefreshSessions,
@@ -261,6 +263,8 @@ fn bind_keys(cx: &mut App) {
     cx.bind_keys([
         KeyBinding::new("secondary-q", Quit, None),
         KeyBinding::new("escape", AbortRun, None),
+        KeyBinding::new("escape", QuitDialogCancel, Some("QuitDialog")),
+        KeyBinding::new("enter", QuitDialogConfirm, Some("QuitDialog")),
         // Composer keys only apply while the input is focused.
         KeyBinding::new("backspace", Backspace, Some("Composer")),
         KeyBinding::new("delete", Delete, Some("Composer")),
@@ -595,6 +599,17 @@ fn main() {
                     theme::watch_system_appearance(window, cx);
                     let app: Entity<OrbitApp> = cx.new(OrbitApp::new);
 
+                    // Closing from the OS caption uses a synchronous veto:
+                    // keep the window alive, then let Orbit's modal collect
+                    // the user's explicit choice. The menu/keybinding Quit
+                    // action routes through the same model method.
+                    let close_app = app.downgrade();
+                    window.on_window_should_close(cx, move |window, cx| {
+                        close_app
+                            .update(cx, |app, cx| app.window_should_close(window, cx))
+                            .unwrap_or(true)
+                    });
+
                     // Focus the composer so typing works immediately; track
                     // window focus so background notifications know whether
                     // the user is already looking at the transcript.
@@ -629,6 +644,5 @@ fn main() {
         updater::signal_relaunch_ready();
 
         cx.activate(true);
-        cx.on_action(|_: &Quit, cx| cx.quit());
     });
 }

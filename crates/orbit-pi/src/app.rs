@@ -669,6 +669,10 @@ pub struct OrbitApp {
     /// Mirror of the persisted automatic-check preference, refreshed when the
     /// updater reports and on toggle, so frames never read the file.
     automatic_updates_enabled: bool,
+    /// Blocking safeguard shown for every user-initiated window/app close.
+    quit_confirmation_open: bool,
+    /// Carries the modal key context so Escape cancels and Enter confirms.
+    quit_confirmation_focus: FocusHandle,
 }
 
 /// An image queued to ride along with the next prompt.
@@ -1173,6 +1177,8 @@ impl OrbitApp {
                 .and_then(|state| state.0.as_ref())
                 .map(|updater| updater.automatically_checks_for_updates())
                 .unwrap_or(false),
+            quit_confirmation_open: false,
+            quit_confirmation_focus: cx.focus_handle(),
         };
 
         // A changed-file row on the Git page opens its diff in Review.
@@ -1864,6 +1870,7 @@ mod helpers;
 mod open_in;
 mod pi_update_ui;
 mod pickers;
+mod quit;
 mod runtime;
 mod search;
 mod session;

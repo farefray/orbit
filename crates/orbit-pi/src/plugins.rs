@@ -306,7 +306,15 @@ fn parse_git(rest: &str) -> Source {
     } else {
         (String::new(), rest.to_string())
     };
-    let path = path.trim().trim_end_matches(".git").to_string();
+    // Pi stores a pinned `repo@ref` in the same directory as `repo`.
+    // Only look for a ref after the host; `git@host:path` is userinfo.
+    let path = path.trim();
+    let path = path
+        .split_once('@')
+        .filter(|(repo, reference)| !repo.is_empty() && !reference.is_empty())
+        .map_or(path, |(repo, _)| repo)
+        .trim_end_matches(".git")
+        .to_string();
     let name = path.rsplit('/').next().unwrap_or(&path).to_string();
     Source::Git { host, path, name }
 }
@@ -464,6 +472,22 @@ mod tests {
                 name: "repo".into(),
             }
         );
+        for source in [
+            "git:github.com/farefray/evidence-subagents@2f0bae3f",
+            "git:git@github.com:farefray/evidence-subagents@2f0bae3f",
+            "https://github.com/farefray/evidence-subagents.git@2f0bae3f",
+            "git:github.com/farefray/evidence-subagents#v1",
+        ] {
+            assert_eq!(
+                parse_source(source),
+                Source::Git {
+                    host: "github.com".into(),
+                    path: "farefray/evidence-subagents".into(),
+                    name: "evidence-subagents".into(),
+                },
+                "{source}"
+            );
+        }
     }
 
     #[test]
@@ -488,6 +512,11 @@ mod tests {
         assert_eq!(
             git.install_path(PackageScope::User, workspace),
             agent_dir().join("git/github.com/o/r")
+        );
+        let pinned = parse_source("git:github.com/o/r@2f0bae3f");
+        assert_eq!(
+            pinned.install_path(PackageScope::Project, workspace),
+            workspace.join(".pi/git/github.com/o/r")
         );
     }
 
