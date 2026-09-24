@@ -1975,14 +1975,14 @@ fn render_assistant(message: &ChatMessage, paint: &RowPaint) -> impl IntoElement
                 // and then works again must not hoist that work above the
                 // answer that preceded it.
                 let group_end = answer_start.map_or(message.steps.len(), |answer| answer + 1);
-                let group_live =
-                    activity_group_is_live(paint.live, group_end, &message.steps);
+                let group_live = activity_group_is_live(paint.live, group_end, &message.steps);
+                // Streaming status updates the summary, never its expansion state.
                 let open = paint
                     .expanded_activities
                     .borrow()
                     .get(&(ix, 0))
                     .copied()
-                    .unwrap_or(group_live);
+                    .unwrap_or(false);
                 let group_has_work = message.steps[..group_end]
                     .iter()
                     .any(|step| !step.thinking.is_empty() || !step.tools.is_empty());
@@ -2048,14 +2048,13 @@ fn render_assistant(message: &ChatMessage, paint: &RowPaint) -> impl IntoElement
                 group_end += 1;
             }
             covered_until = group_end;
-            let group_live =
-                activity_group_is_live(paint.live, group_end, &message.steps);
+            let group_live = activity_group_is_live(paint.live, group_end, &message.steps);
             let open = paint
                 .expanded_activities
                 .borrow()
                 .get(&(ix, step_ix))
                 .copied()
-                .unwrap_or(group_live);
+                .unwrap_or(false);
             content = content.child(render_activity_group(
                 ix,
                 step_ix..group_end,
@@ -2395,9 +2394,7 @@ fn render_activity_group(
                     let expanded_activities = expanded_activities.clone();
                     let scroller = scroller.clone();
                     move |_, _, cx| {
-                        let mut map = expanded_activities.borrow_mut();
-                        let next = !map.get(&key).copied().unwrap_or(false);
-                        map.insert(key, next);
+                        expanded_activities.borrow_mut().insert(key, !open);
                         scroller.remeasure_toggle(ix);
                         cx.refresh_windows();
                     }
@@ -8217,6 +8214,58 @@ mod tests {
                 view.streaming.set(Some(0));
             }
             render_transcript(view, cx)
+        }
+    }
+
+    #[gpui::test]
+    fn activity_groups_stay_collapsed_as_new_work_arrives(cx: &mut gpui::TestAppContext) {
+        let cx = cx.add_empty_window();
+        cx.update(|_, cx| cx.set_global(theme::Theme::for_id(theme::ThemeId::Orbit)));
+        let state = Rc::new(RefCell::new(TextSelection::new()));
+        let messages = test_messages();
+        messages.borrow_mut().truncate(1);
+        messages.borrow_mut()[0].steps = vec![Step {
+            thinking: "Hidden initial reasoning".into(),
+            ..Step::default()
+        }];
+        let scroller = MessageScrollerState::new(1);
+        let view = cx.update(|_, cx| {
+            cx.new(|_| SelectTestView {
+                messages: messages.clone(),
+                state: state.clone(),
+                scroller: scroller.clone(),
+                main_width: px(900.),
+                open_work: false,
+                live: true,
+            })
+        });
+
+        // Cover both groups and the empty step between successive tool calls.
+        for stage in 0..5 {
+            match stage {
+                1 => messages.borrow_mut()[0].steps[0].text = "Visible answer".into(),
+                2 => messages.borrow_mut()[0].steps.push(Step {
+                    thinking: "Hidden subsequent reasoning".into(),
+                    ..Step::default()
+                }),
+                3 => messages.borrow_mut()[0].steps.push(Step::default()),
+                4 => messages.borrow_mut()[0].steps[2].thinking = "Hidden newest reasoning".into(),
+                _ => {}
+            }
+            scroller.remeasure_toggle(0);
+            cx.draw(
+                point(px(0.), px(0.)),
+                gpui::size(px(900.), px(1600.)),
+                |_, _| view.clone(),
+            );
+            assert!(
+                state
+                    .borrow()
+                    .blocks
+                    .iter()
+                    .all(|block| !block.text.contains("Hidden")),
+                "activity bodies must remain hidden at streaming stage {stage}"
+            );
         }
     }
 
