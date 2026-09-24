@@ -798,7 +798,7 @@ pub(crate) fn dismiss_rail_hint_state(
 pub struct Transcript {
     pub(crate) agent_selection: crate::agents::AgentSelection,
     messages: Rc<RefCell<Vec<ChatMessage>>>,
-    /// Cross-block text selection + right-click copy menu state.
+    /// Cross-block text selection + right-click copy/quote menu state.
     text_selection: transcript_view::TextSelectionState,
     scroller: MessageScrollerState,
     /// Index of the assistant message currently being streamed, if any.
@@ -910,6 +910,11 @@ impl Transcript {
     /// path (`cmd-c`) reads it without stealing the composer's own copy.
     pub fn selected_text(&self) -> Option<String> {
         self.text_selection.borrow().selected_text()
+    }
+
+    /// Close an open quote draft and return its selected text.
+    pub fn take_quote(&self) -> Option<String> {
+        self.text_selection.borrow_mut().take_quote()
     }
 
     /// Rebuild the whole transcript from a `get_messages` response payload.
@@ -2118,6 +2123,8 @@ impl Transcript {
         main_width: Pixels,
         review_changes: Option<crate::transcript_view::ReviewOpener>,
         image_opener: Option<crate::transcript_view::ImageOpener>,
+        quote_comment: gpui::Entity<crate::composer::ComposerInput>,
+        quote_submit: crate::transcript_view::QuoteSubmitter,
         search_hits: Option<HashSet<usize>>,
         search_active: Option<usize>,
         cx: &gpui::App,
@@ -2175,6 +2182,8 @@ impl Transcript {
                 summary_usage,
                 review_changes,
                 image_opener,
+                quote_comment,
+                quote_submit,
                 search_hits: search_hits.map(|hits| Rc::new(RefCell::new(hits))),
                 search_active: search_active.map(|ix| Rc::new(Cell::new(Some(ix)))),
             },

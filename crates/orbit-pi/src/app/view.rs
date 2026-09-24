@@ -921,6 +921,8 @@ impl Render for OrbitApp {
                                 main_width,
                                 Some(self.review_opener(cx)),
                                 Some(self.image_opener(cx)),
+                                self.quote_comment.clone(),
+                                self.quote_submitter(cx),
                                 self.search_hits(),
                                 self.search_active(),
                                 cx,

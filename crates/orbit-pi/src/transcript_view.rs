@@ -25,12 +25,12 @@ use std::{
 
 use gpui::{
     anchored, canvas, deferred, div, img, linear_color_stop, linear_gradient, list, point,
-    prelude::*, px, Animation, AnimationExt, AnyElement, App, Bounds, ClipboardItem,
-    CursorStyle, DispatchPhase, Element, ElementId, Font, FontFeatures, FontStyle, FontWeight,
-    GlobalElementId, Hitbox, HitboxBehavior, Hsla, Image, ImageSource, InspectorElementId,
-    InteractiveText, LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
-    ObjectFit, Pixels, ScrollHandle, ScrollWheelEvent, SharedString, StrikethroughStyle,
-    StyledText, TextAlign, TextLayout, TextRun, UnderlineStyle, Window,
+    prelude::*, px, Animation, AnimationExt, AnyElement, App, Bounds, ClipboardItem, CursorStyle,
+    DispatchPhase, Element, ElementId, Entity, Focusable, Font, FontFeatures, FontStyle,
+    FontWeight, GlobalElementId, Hitbox, HitboxBehavior, Hsla, Image, ImageSource,
+    InspectorElementId, InteractiveText, LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent,
+    MouseUpEvent, ObjectFit, Pixels, ScrollHandle, ScrollWheelEvent, SharedString,
+    StrikethroughStyle, StyledText, TextAlign, TextLayout, TextRun, UnderlineStyle, Window,
 };
 
 use std::ops::Range;
@@ -42,6 +42,7 @@ use serde_json::Value;
 use orbit_rpc::MessageUsage;
 
 use crate::app::{PopoverSurface, BUTTON_GROUP};
+use crate::composer::ComposerInput;
 use crate::context_meter::{format_tokens, hit_percent_label};
 use crate::highlight::{self, Token};
 use crate::message_scroller::{self, MessageScrollerState};
@@ -57,6 +58,9 @@ pub(crate) type ReviewOpener = Rc<dyn Fn(&mut Window, &mut App)>;
 /// Opens one attachment image in the app's full-window lightbox. Handed down
 /// from the app so an image tile can open a surface it doesn't own.
 pub(crate) type ImageOpener = Rc<dyn Fn(Arc<Image>, &mut Window, &mut App)>;
+
+/// Stages the quoted selection and its comment in the app's composer.
+pub(crate) type QuoteSubmitter = Rc<dyn Fn(String, &mut Window, &mut App)>;
 
 /// The transcript content column's max width.
 /// Normal message content keeps this centered measure. Assistant tables
@@ -156,7 +160,7 @@ pub(crate) type ThinkingDetached = Rc<RefCell<HashSet<(usize, usize)>>>;
 
 pub(crate) struct TranscriptView {
     pub messages: Rc<RefCell<Vec<ChatMessage>>>,
-    /// Cross-block text selection + the right-click copy menu.
+    /// Cross-block text selection + the right-click copy/quote menu.
     pub text_selection: TextSelectionState,
     pub scroller: MessageScrollerState,
     pub streaming: Rc<Cell<Option<usize>>>,
@@ -214,6 +218,8 @@ pub(crate) struct TranscriptView {
     /// Opens an attachment image in the full-window lightbox; `None` leaves
     /// the tiles non-interactive.
     pub image_opener: Option<ImageOpener>,
+    pub quote_comment: Entity<ComposerInput>,
+    pub quote_submit: QuoteSubmitter,
     /// Message indices matching the open find query; `None` when find is
     /// closed. Rows get a quiet wash.
     pub search_hits: Option<Rc<RefCell<HashSet<usize>>>>,
@@ -246,6 +252,7 @@ struct TextBlock {
 struct SelectedBlock {
     key: ElementId,
     text: SharedString,
+    message_ix: usize,
 }
 
 /// One endpoint of a selection: index into [`Selection::blocks`] plus a byte
@@ -275,11 +282,19 @@ impl Selection {
 }
 
 /// The right-click menu over transcript text: `Copy Selection` reads the live
-/// selection, `Copy Message` carries the message text captured on open.
+/// selection, `Copy Message` carries the message text captured on open, and
+/// `Quote` is offered only for a selection inside one assistant reply.
 #[derive(Clone)]
 struct TextMenu {
     position: gpui::Point<Pixels>,
     message_text: String,
+    can_quote: bool,
+}
+
+#[derive(Clone)]
+struct QuoteDraft {
+    position: gpui::Point<Pixels>,
+    text: String,
 }
 
 /// Shared text-selection state — one per transcript, cloned into every text
@@ -300,6 +315,7 @@ pub(crate) struct TextSelection {
     /// The press that started the drag, for link resolution on release.
     down: Option<(ElementId, usize)>,
     menu: Option<TextMenu>,
+    quote: Option<QuoteDraft>,
 }
 
 pub(crate) type TextSelectionState = Rc<RefCell<TextSelection>>;
@@ -316,6 +332,7 @@ impl TextSelection {
             moved: false,
             down: None,
             menu: None,
+            quote: None,
         }
     }
 
@@ -373,6 +390,7 @@ impl TextSelection {
 
     fn begin_selection(&mut self, position: gpui::Point<Pixels>) {
         self.menu = None;
+        self.quote = None;
         self.moved = false;
         self.down = None;
         let Some((index, offset)) = self.hit(position) else {
@@ -387,6 +405,7 @@ impl TextSelection {
             .map(|block| SelectedBlock {
                 key: block.key.clone(),
                 text: block.text.clone(),
+                message_ix: block.message_ix,
             })
             .collect();
         let point = SelectPoint {
@@ -453,6 +472,15 @@ impl TextSelection {
     pub(crate) fn clear(&mut self) {
         self.clear_selection();
         self.menu = None;
+        self.quote = None;
+    }
+
+    pub(crate) fn take_quote(&mut self) -> Option<String> {
+        let text = self.quote.take().map(|draft| draft.text);
+        if text.is_some() {
+            self.clear_selection();
+        }
+        text
     }
 
     /// Message index of the block under `position` (context menu). A press in
@@ -497,6 +525,21 @@ impl TextSelection {
             text.len()
         };
         (from < to).then_some(from..to)
+    }
+
+    /// The message containing the entire nonempty selection, if it stays in
+    /// one row. Quotes must not accidentally mix a reply with the next turn.
+    fn selected_message(&self) -> Option<usize> {
+        let selection = self.selection.as_ref()?;
+        let (start, end) = selection.normalized();
+        if start == end {
+            return None;
+        }
+        let message_ix = selection.blocks.get(start.block)?.message_ix;
+        selection.blocks[start.block..=end.block]
+            .iter()
+            .all(|block| block.message_ix == message_ix)
+            .then_some(message_ix)
     }
 
     /// The selected text, one line per selected block (the clipboard form).
@@ -753,7 +796,7 @@ impl IntoElement for SelectableText {
 }
 
 /// Register the transcript panel's mouse handlers: drag-select (cross-block),
-/// right-click menu, link clicks, and click-outside clearing. The canvas
+/// right-click copy/quote menu, link clicks, and click-outside clearing. The canvas
 /// listener receives every window mouse event, so a drag that leaves the
 /// panel keeps updating (clamped to the nearest text block).
 fn register_text_selection(
@@ -769,7 +812,7 @@ fn register_text_selection(
             if phase != DispatchPhase::Capture || !hitbox.is_hovered(window) {
                 return;
             }
-            let menu_open = state.borrow().menu.is_some();
+            let menu_open = state.borrow().menu.is_some() || state.borrow().quote.is_some();
             match event.button {
                 MouseButton::Left => {
                     // The open menu owns the next press; its outside-click
@@ -784,14 +827,17 @@ fn register_text_selection(
                     let Some(message_ix) = state.borrow().message_at(event.position) else {
                         return;
                     };
+                    let messages = messages.borrow();
                     let message_text = messages
-                        .borrow()
                         .get(message_ix)
                         .map(ChatMessage::text)
                         .unwrap_or_default();
+                    let can_quote = state.borrow().selected_message() == Some(message_ix)
+                        && messages.get(message_ix).is_some_and(|message| !message.user);
                     state.borrow_mut().menu = Some(TextMenu {
                         position: event.position,
                         message_text,
+                        can_quote,
                     });
                     window.refresh();
                 }
@@ -838,13 +884,19 @@ fn register_text_selection(
     });
 }
 
-/// The right-click menu: `Copy Selection` (disabled without one) and
-/// `Copy Message` (the clicked message's full text).
-fn text_selection_menu(menu: &TextMenu, state: TextSelectionState, theme: Theme) -> AnyElement {
+/// The right-click menu: copy selection, copy message, or quote a selected
+/// part of the clicked assistant reply.
+fn text_selection_menu(
+    menu: &TextMenu,
+    state: TextSelectionState,
+    comment: Entity<ComposerInput>,
+    theme: Theme,
+) -> AnyElement {
     let selected = state.borrow().selected_text();
     let copy_selection = selected.clone();
     let close = state.clone();
     let copy_selection_item = selection_menu_item(
+        "copy-selection-action",
         tr!("transcript.copy_selection"),
         selected.is_some(),
         theme,
@@ -860,12 +912,37 @@ fn text_selection_menu(menu: &TextMenu, state: TextSelectionState, theme: Theme)
     let copy_message = menu.message_text.clone();
     let close = state.clone();
     let copy_message_item = selection_menu_item(
+        "copy-message-action",
         tr!("transcript.copy_message"),
         true,
         theme,
         move |window, cx| {
             cx.write_to_clipboard(ClipboardItem::new_string(copy_message.clone()));
             close.borrow_mut().menu = None;
+            cx.stop_propagation();
+            window.refresh();
+        },
+    );
+    let quote_state = state.clone();
+    let quote_position = menu.position;
+    let quote_item = selection_menu_item(
+        "quote-selection-action",
+        tr!("transcript.quote"),
+        menu.can_quote && selected.is_some(),
+        theme,
+        move |window, cx| {
+            let selected = quote_state.borrow().selected_text();
+            if let Some(text) = selected {
+                let mut state = quote_state.borrow_mut();
+                state.quote = Some(QuoteDraft {
+                    position: quote_position,
+                    text,
+                });
+                state.menu = None;
+                drop(state);
+                comment.update(cx, |input, cx| input.clear(cx));
+                window.focus(&comment.read(cx).focus_handle(cx));
+            }
             cx.stop_propagation();
             window.refresh();
         },
@@ -888,19 +965,88 @@ fn text_selection_menu(menu: &TextMenu, state: TextSelectionState, theme: Theme)
                     window.refresh();
                 })
                 .child(copy_selection_item)
-                .child(copy_message_item),
+                .child(copy_message_item)
+                .child(quote_item),
+        ),
+    )
+    .into_any_element()
+}
+
+fn quote_popover(
+    draft: &QuoteDraft,
+    state: TextSelectionState,
+    comment: Entity<ComposerInput>,
+    submit: QuoteSubmitter,
+    theme: Theme,
+) -> AnyElement {
+    let dismiss = state.clone();
+    let confirm = state.clone();
+    deferred(
+        anchored().position(draft.position).snap_to_window().child(
+            div()
+                .id("transcript-quote-popover")
+                .w(px(320.))
+                .p(px(12.))
+                .rounded(px(9.))
+                .popover_surface(theme)
+                .flex()
+                .flex_col()
+                .gap(px(10.))
+                .occlude()
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .on_mouse_down_out(move |_, window, _| {
+                    dismiss.borrow_mut().take_quote();
+                    window.refresh();
+                })
+                .child(
+                    div()
+                        .id("quote-preview")
+                        .text_size(theme.ui_px(12.))
+                        .text_color(theme.text_2)
+                        .max_h(px(90.))
+                        .overflow_y_scroll()
+                        .child(draft.text.clone()),
+                )
+                .child(
+                    div()
+                        .w_full()
+                        .min_h(px(70.))
+                        .p(px(8.))
+                        .rounded(px(6.))
+                        .border_1()
+                        .border_color(theme.border)
+                        .bg(theme.bg_composer)
+                        .text_size(theme.ui_px(13.))
+                        .child(comment),
+                )
+                .child(selection_menu_item(
+                    "add-quote-action",
+                    tr!("transcript.add_quote"),
+                    true,
+                    theme,
+                    move |window, cx| {
+                        if let Some(text) = confirm.borrow_mut().take_quote() {
+                            submit(text, window, cx);
+                        }
+                        cx.stop_propagation();
+                        window.refresh();
+                    },
+                )),
         ),
     )
     .into_any_element()
 }
 
 fn selection_menu_item(
+    id: &'static str,
     label: String,
     enabled: bool,
     theme: Theme,
     on_click: impl Fn(&mut Window, &mut App) + 'static,
 ) -> AnyElement {
     div()
+        .id(id)
+        .debug_selector(move || id.to_string())
         .px(px(10.))
         .py(px(6.))
         .text_size(theme.ui_px(12.))
@@ -1233,7 +1379,22 @@ pub(crate) fn render_transcript(view: TranscriptView, cx: &gpui::App) -> impl In
         });
     let menu = menu_selection.borrow().menu.clone();
     if let Some(menu) = menu {
-        panel = panel.child(text_selection_menu(&menu, menu_selection, theme));
+        panel = panel.child(text_selection_menu(
+            &menu,
+            menu_selection.clone(),
+            view.quote_comment.clone(),
+            theme,
+        ));
+    }
+    let quote = menu_selection.borrow().quote.clone();
+    if let Some(quote) = quote {
+        panel = panel.child(quote_popover(
+            &quote,
+            menu_selection,
+            view.quote_comment,
+            view.quote_submit,
+            theme,
+        ));
     }
     panel
 }
@@ -7682,6 +7843,7 @@ mod tests {
             .map(|(ix, text)| SelectedBlock {
                 key: ElementId::Name(format!("block-{ix}").into()),
                 text: (*text).to_string().into(),
+                message_ix: 0,
             })
             .collect();
         let mut state = TextSelection::new();
@@ -7728,6 +7890,20 @@ mod tests {
         );
         // A collapsed selection is nothing to copy.
         let state = selection_over(&["only"], (0, 2), (0, 2));
+        assert_eq!(state.selected_text(), None);
+    }
+
+    #[test]
+    fn quotes_only_accept_a_selection_within_one_message() {
+        let mut state = selection_over(&["hello", "world"], (0, 1), (1, 3));
+        assert_eq!(state.selected_message(), Some(0));
+        state.selection.as_mut().unwrap().blocks[1].message_ix = 1;
+        assert_eq!(state.selected_message(), None);
+        state.quote = Some(QuoteDraft {
+            position: point(px(0.), px(0.)),
+            text: "hello".into(),
+        });
+        assert_eq!(state.take_quote().as_deref(), Some("hello"));
         assert_eq!(state.selected_text(), None);
     }
 
@@ -7816,6 +7992,7 @@ mod tests {
         state: TextSelectionState,
         messages: Rc<RefCell<Vec<ChatMessage>>>,
         scroller: MessageScrollerState,
+        cx: &mut gpui::Context<SelectTestView>,
     ) -> TranscriptView {
         TranscriptView {
             scroller,
@@ -7849,6 +8026,8 @@ mod tests {
             summary_usage: None,
             review_changes: None,
             image_opener: None,
+            quote_comment: cx.new(ComposerInput::new),
+            quote_submit: Rc::new(|_, _, _| {}),
             search_hits: None,
             search_active: None,
         }
@@ -8020,6 +8199,7 @@ mod tests {
                 self.state.clone(),
                 self.messages.clone(),
                 self.scroller.clone(),
+                cx,
             );
             view.main_width = self.main_width;
             if self.open_work {
@@ -8435,6 +8615,50 @@ mod tests {
             (px(0.)..px(100.)).contains(&(height - last_tool.bottom())),
             "only the footer and row padding should follow the settled work"
         );
+    }
+
+    #[gpui::test]
+    fn selected_assistant_text_opens_quote_popover(cx: &mut gpui::TestAppContext) {
+        let mut cx = cx.add_empty_window();
+        cx.update(|_, cx| cx.set_global(theme::Theme::for_id(theme::ThemeId::Orbit)));
+        let state: TextSelectionState = Rc::new(RefCell::new(TextSelection::new()));
+        let messages = test_messages();
+        let scroller = MessageScrollerState::new(messages.borrow().len());
+        let state_in = state.clone();
+        let view = cx.update(|_, cx| {
+            cx.new(move |_| SelectTestView {
+                messages,
+                state: state_in,
+                scroller,
+                main_width: px(900.),
+                open_work: false,
+                live: false,
+            })
+        });
+        let paint = |cx: &mut gpui::VisualTestContext| {
+            let view = view.clone();
+            cx.draw(point(px(0.), px(0.)), gpui::size(px(900.), px(600.)), move |_, _| view.clone());
+        };
+        paint(&mut cx);
+        let first = state.borrow().blocks[0].bounds;
+        let start = point(first.left() + px(2.), first.top() + px(8.));
+        let end = point(first.left() + px(80.), first.top() + px(8.));
+        cx.simulate_mouse_down(start, MouseButton::Left, gpui::Modifiers::none());
+        paint(&mut cx);
+        cx.simulate_mouse_move(end, Some(MouseButton::Left), gpui::Modifiers::none());
+        paint(&mut cx);
+        cx.simulate_mouse_up(end, MouseButton::Left, gpui::Modifiers::none());
+        assert_eq!(state.borrow().selected_message(), Some(0));
+        paint(&mut cx);
+        cx.simulate_mouse_down(end, MouseButton::Right, gpui::Modifiers::none());
+        paint(&mut cx);
+        let action = cx.debug_bounds("quote-selection-action").expect("quote action visible");
+        cx.simulate_mouse_down(point(action.left() + px(10.), action.top() + px(10.)),
+            MouseButton::Left, gpui::Modifiers::none());
+        paint(&mut cx);
+        assert!(state.borrow().quote.is_some());
+        paint(&mut cx);
+        assert!(cx.debug_bounds("add-quote-action").is_some(), "quote popover should render its submit action");
     }
 
     /// The panel's selection plumbing end-to-end: a simulated drag from the

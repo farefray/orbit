@@ -15,6 +15,35 @@ pub(super) enum SendMode {
     Steer,
 }
 
+/// Prefix every line, including blank lines, so a multiline selection stays
+/// visibly separate from the user's own comment in the next prompt.
+fn format_quote(quote: &str, comment: &str) -> String {
+    let quoted = quote
+        .lines()
+        .map(|line| format!("> {line}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    if comment.trim().is_empty() {
+        quoted
+    } else {
+        format!("{quoted}\n\n{}", comment.trim())
+    }
+}
+
+#[cfg(test)]
+mod quote_tests {
+    use super::format_quote;
+
+    #[test]
+    fn quote_preserves_multiline_selection_and_optional_comment() {
+        assert_eq!(
+            format_quote("first\n\nthird", "  please fix this  "),
+            "> first\n> \n> third\n\nplease fix this"
+        );
+        assert_eq!(format_quote("a", "  "), "> a");
+    }
+}
+
 /// A workspace-relative `/`-separated path for the Files toolbar. Falls back
 /// to the absolute path when the file lies outside the workspace.
 fn relative_display(root: &std::path::Path, path: &std::path::Path) -> String {
@@ -329,6 +358,14 @@ impl OrbitApp {
             self.rename_session(cx);
             return;
         }
+        if self.quote_comment.read(cx).focus_handle(cx).is_focused(window) {
+            if let Some(quote) = self.transcript.take_quote() {
+                self.append_quote(&quote, window, cx);
+            } else {
+                self.input.read(cx).focus(window);
+            }
+            return;
+        }
         // Enter commits the highlighted autocomplete entry while the menu
         // is open; a second Enter submits.
         if self.commit_autocomplete_if_open(cx) {
@@ -383,6 +420,12 @@ impl OrbitApp {
         }
         if self.transcript_search.is_some() {
             self.close_search(cx);
+            return;
+        }
+        if self.quote_comment.read(cx).focus_handle(cx).is_focused(window) {
+            self.transcript.take_quote();
+            self.input.read(cx).focus(window);
+            cx.notify();
             return;
         }
         if self.command_palette.take().is_some() {
@@ -2182,6 +2225,30 @@ impl OrbitApp {
                 cx.notify();
             })
             .ok();
+        })
+    }
+
+    /// A quote is only staged in the composer; the user decides when to send it.
+    fn append_quote(&mut self, quote: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let comment = self.quote_comment.read(cx).text();
+        let addition = format_quote(quote, &comment);
+        self.input.update(cx, |input, cx| {
+            let current = input.text();
+            let separator = if current.is_empty() { "" } else { "\n\n" };
+            input.set_text(format!("{current}{separator}{addition}"), cx);
+        });
+        self.quote_comment.update(cx, |input, cx| input.clear(cx));
+        self.input.read(cx).focus(window);
+        cx.notify();
+    }
+
+    pub(super) fn quote_submitter(
+        &self,
+        cx: &Context<Self>,
+    ) -> crate::transcript_view::QuoteSubmitter {
+        let this = cx.weak_entity();
+        Rc::new(move |quote, window, cx| {
+            this.update(cx, |app, cx| app.append_quote(&quote, window, cx)).ok();
         })
     }
 

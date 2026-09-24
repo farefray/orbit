@@ -469,6 +469,8 @@ pub struct OrbitApp {
     /// selection wins over the focused composer's own copy, but only while
     /// one exists (the composer keeps its copy otherwise).
     _copy_selection_sub: Subscription,
+    /// Draft comment for quoting a transcript selection.
+    quote_comment: Entity<ComposerInput>,
     /// Onboarding dependency check results (pi, node, git).
     deps: Vec<Dependency>,
     /// Whether the setup page is open on request (Settings → About →
@@ -751,6 +753,24 @@ pub(crate) struct ModelEntry {
     pub(crate) context_window: Option<u64>,
 }
 
+fn is_transcript_copy(key: &gpui::Keystroke) -> bool {
+    key.key == "c"
+        && key.modifiers.secondary()
+        && key.modifiers.number_of_modifiers() == 1
+}
+
+#[cfg(test)]
+mod transcript_copy_tests {
+    use super::is_transcript_copy;
+
+    #[test]
+    fn copy_uses_the_platform_secondary_modifier_only() {
+        for key in ["secondary-c", "secondary-shift-c", "secondary-v", "alt-c"] {
+            assert_eq!(is_transcript_copy(&gpui::Keystroke::parse(key).unwrap()), key == "secondary-c", "{key}");
+        }
+    }
+}
+
 impl OrbitApp {
     pub fn new(cx: &mut Context<Self>) -> Self {
         let autocomplete: SharedAutocomplete = Rc::new(std::cell::RefCell::new(
@@ -869,23 +889,26 @@ impl OrbitApp {
         // the send button's quiet/ready state tracks the text as you type.
         let input_sub = cx.observe(&input, |_, _, cx| cx.notify());
 
-        // `cmd-c` with a live transcript selection copies that selection even
-        // while the composer holds focus — an interceptor is the only hook
+        // The platform copy shortcut with a live transcript selection copies
+        // that selection even while the composer holds focus — an interceptor is the only hook
         // that runs before focus-path action dispatch, so the composer keeps
         // its own copy whenever the transcript has nothing selected.
+        let quote_comment = cx.new(|cx| {
+            ComposerInput::new(cx)
+                .with_element_id("quote-comment")
+                .with_placeholder_key("transcript.quote_comment_placeholder")
+                .with_max_lines(4)
+        });
         let copy_selection_sub = {
             let app = cx.entity().downgrade();
-            cx.intercept_keystrokes(move |event, _window, cx| {
-                let keystroke = &event.keystroke;
-                if keystroke.key != "c"
-                    || !keystroke.modifiers.platform
-                    || keystroke.modifiers.shift
-                    || keystroke.modifiers.alt
-                    || keystroke.modifiers.control
-                {
+            cx.intercept_keystrokes(move |event, window, cx| {
+                if !is_transcript_copy(&event.keystroke) {
                     return;
                 }
                 let _ = app.update(cx, |app, cx| {
+                    if app.quote_comment.read(cx).focus_handle(cx).is_focused(window) {
+                        return;
+                    }
                     let Some(text) = app.transcript.selected_text() else {
                         return;
                     };
@@ -1072,6 +1095,7 @@ impl OrbitApp {
             _theme_sub: theme_sub,
             _input_sub: input_sub,
             _copy_selection_sub: copy_selection_sub,
+            quote_comment,
             deps,
             setup_open: false,
             host,
