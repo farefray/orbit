@@ -40,6 +40,8 @@ pub struct SessionInfo {
     /// would otherwise make an untouched session read "now" and jump to the
     /// top of the sidebar. Only a new user/agent message moves this.
     pub modified: SystemTime,
+    /// Proven child origin; ordinary forks/clones remain main sessions.
+    pub subagent: Option<crate::session_origin::SubagentOrigin>,
 }
 
 /// The default pi session store.
@@ -65,9 +67,9 @@ pub fn load_sessions() -> Vec<SessionInfo> {
 /// Load every session under `dir` — the scan body of [`load_sessions`],
 /// shared with [`SessionWatcher`] so a watched store reloads the same way.
 fn load_sessions_in(dir: &Path) -> Vec<SessionInfo> {
-    let mut out = Vec::new();
+    let mut paths = Vec::new();
     let Ok(groups) = fs::read_dir(dir) else {
-        return out;
+        return Vec::new();
     };
     for group in groups.flatten() {
         let Ok(files) = fs::read_dir(group.path()) else {
@@ -76,12 +78,15 @@ fn load_sessions_in(dir: &Path) -> Vec<SessionInfo> {
         for file in files.flatten() {
             let path = file.path();
             if path.extension().is_some_and(|e| e == "jsonl") {
-                if let Some(info) = read_session(&path) {
-                    out.push(info);
-                }
+                paths.push(path);
             }
         }
     }
+    let mut origins = crate::session_origin::OriginResolver::new(&paths);
+    let mut out: Vec<_> = paths
+        .iter()
+        .filter_map(|path| read_session_cached(path, &mut origins))
+        .collect();
     // Newest activity first, with the path as a deterministic tiebreak.
     out.sort_by(|a, b| {
         b.modified
@@ -251,7 +256,15 @@ impl SessionWatcher {
     }
 }
 
+#[cfg(test)]
 fn read_session(path: &Path) -> Option<SessionInfo> {
+    read_session_cached(path, &mut crate::session_origin::OriginResolver::new(&[]))
+}
+
+fn read_session_cached(
+    path: &Path,
+    origins: &mut crate::session_origin::OriginResolver,
+) -> Option<SessionInfo> {
     let file = fs::File::open(path).ok()?;
     let mut reader = BufReader::new(file);
     let fallback = fs::metadata(path).ok()?.modified().ok()?;
@@ -268,6 +281,14 @@ fn read_session(path: &Path) -> Option<SessionInfo> {
     }
     let id = header.get("id")?.as_str()?.to_string();
     let cwd = PathBuf::from(header.get("cwd")?.as_str()?);
+    let parent = header
+        .get("parentSession")
+        .and_then(Value::as_str)
+        .map(PathBuf::from)
+        .filter(|p| crate::session_origin::path_key(p) != crate::session_origin::path_key(path));
+    let mut initial_name = None;
+    let mut child_context = false;
+    let mut subagent = None;
 
     // Scan a bounded number of lines for the first user message → preview.
     let mut first_text = String::new();
@@ -279,14 +300,31 @@ fn read_session(path: &Path) -> Option<SessionInfo> {
                 let Ok(value) = serde_json::from_str::<Value>(line.trim()) else {
                     continue;
                 };
-                if value.get("type")?.as_str() == Some("message") {
+                if initial_name.is_none() && value["type"] == "session_info" {
+                    initial_name = value["name"].as_str().map(str::to_owned);
+                }
+                if let Some(parent) = &parent {
+                    subagent = subagent
+                        .or_else(|| crate::session_origin::declared_origin(&value, &id, parent));
+                }
+                if value["type"] == "message" {
                     let message = &value["message"];
+                    if message["role"] == "system" {
+                        child_context |= message["sections"]["preamble"]
+                            .as_str()
+                            .is_some_and(|s| s.contains("\n<sub_agent_context>\n"));
+                    }
                     if message["role"].as_str() == Some("user") {
                         first_text = first_user_text(message);
                         break;
                     }
                 }
             }
+        }
+    }
+    if subagent.is_none() {
+        if let (Some(parent), Some(name)) = (&parent, &initial_name) {
+            subagent = origins.resolve(parent, name, &first_text, child_context);
         }
     }
     let first_message = cap_chars(&first_text, 110);
@@ -311,6 +349,7 @@ fn read_session(path: &Path) -> Option<SessionInfo> {
         title,
         first_message,
         modified,
+        subagent,
     })
 }
 
@@ -526,6 +565,10 @@ pub fn time_bucket(modified: SystemTime) -> &'static str {
         _ => "Older",
     }
 }
+
+#[cfg(test)]
+#[path = "sessions_subagent_tests.rs"]
+mod subagent_tests;
 
 #[cfg(test)]
 mod tests {
@@ -957,6 +1000,12 @@ mod debug_tests {
                 s.title.chars().take(40).collect(),
             ));
         }
+        for child in sessions.iter().filter(|s| s.subagent.is_some()) {
+            println!("  CHILD [{}] {}", workspace_label(&child.cwd), child.title);
+        }
+        println!("MAIN: {}, SUBAGENTS: {}",
+            sessions.iter().filter(|s| s.subagent.is_none()).count(),
+            sessions.iter().filter(|s| s.subagent.is_some()).count());
         let mut total = 0;
         for (label, rows) in &groups {
             total += rows.len();

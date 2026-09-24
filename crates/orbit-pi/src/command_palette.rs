@@ -123,6 +123,7 @@ impl Section {
 enum PaletteAction {
     OpenSession(SessionInfo),
     Run(PaletteCommand),
+    ToggleSubagents,
 }
 
 /// One row in the results list.
@@ -213,6 +214,7 @@ pub struct CommandPalette {
     scroll: ScrollHandle,
     highlighted: usize,
     last_filter: String,
+    include_subagents: bool,
     on_open: OpenSession,
     on_command: RunCommand,
     /// `bool` = dismissed by an outside mouse-down (vs. escape).
@@ -238,6 +240,7 @@ impl CommandPalette {
             scroll: ScrollHandle::new(),
             highlighted: 0,
             last_filter: String::new(),
+            include_subagents: false,
             on_open,
             on_command,
             on_dismiss,
@@ -280,6 +283,7 @@ impl CommandPalette {
             .sessions
             .iter()
             .enumerate()
+            .filter(|(_, session)| self.include_subagents || session.subagent.is_none())
             .map(|(order, session)| {
                 let workspace = crate::sessions::workspace_label(&session.cwd);
                 let active = self.snapshot.active_path.as_ref() == Some(&session.path);
@@ -287,12 +291,15 @@ impl CommandPalette {
                     "{workspace} · {}",
                     crate::sessions::relative_time(session.modified)
                 );
+                if let Some(origin) = &session.subagent {
+                    detail = format!("{} · {} · {detail}", tr!("agents.subagent"), origin.kind);
+                }
                 if active {
                     detail.push_str(&tr!("command_palette.current"));
                 }
                 PaletteItem {
                     section: Section::Sessions,
-                    icon: "icons/chat.svg",
+                    icon: if session.subagent.is_some() { "icons/tools/task.svg" } else { "icons/chat.svg" },
                     label: session.title.clone(),
                     detail: Some(detail),
                     shortcut: None,
@@ -535,7 +542,22 @@ impl CommandPalette {
                 next(),
             ));
         }
+        items.push(PaletteItem {
+            section: Section::Commands,
+            icon: "icons/tools/task.svg",
+            label: if self.include_subagents { tr!("agents.hide_subagents") } else { tr!("agents.include_subagents") },
+            detail: None, shortcut: None, action: PaletteAction::ToggleSubagents,
+            search: format!("{} {} subagents children agents", tr!("agents.include_subagents"), tr!("agents.hide_subagents")).to_lowercase(),
+            order: next(), recency: 0,
+        });
         items
+    }
+
+    fn toggle_subagents(&mut self, cx: &mut Context<Self>) {
+        self.include_subagents = !self.include_subagents;
+        self.highlighted = 0;
+        self.scroll.set_offset(point(px(0.), px(0.)));
+        cx.notify();
     }
 
     /// Rows for the current query: an empty query lists recent sessions plus
@@ -648,6 +670,7 @@ impl CommandPalette {
                 action: PaletteAction::Run(command),
                 ..
             }) => (self.on_command)(*command, window, cx),
+            Some(PaletteItem { action: PaletteAction::ToggleSubagents, .. }) => self.toggle_subagents(cx),
             None => {}
         }
     }
@@ -748,7 +771,7 @@ impl Render for CommandPalette {
                     PaletteAction::OpenSession(session) => {
                         self.snapshot.active_path.as_ref() == Some(&session.path)
                     }
-                    PaletteAction::Run(_) => false,
+                    PaletteAction::Run(_) | PaletteAction::ToggleSubagents => false,
                 };
                 list = list.child(render_row(
                     &rows,
@@ -793,7 +816,11 @@ impl Render for CommandPalette {
                     .text_size(theme.ui_px(15.))
                     .text_color(theme.text)
                     .child(icon("icons/search.svg", 16., theme.text_3))
-                    .child(div().flex_1().min_w_0().child(self.filter.clone())),
+                    .child(div().flex_1().min_w_0().child(self.filter.clone()))
+                    .child(div().id("include-subagents").flex_none().cursor_pointer()
+                        .text_size(theme.ui_px(11.)).text_color(if self.include_subagents { theme.text } else { theme.text_3 })
+                        .child(if self.include_subagents { tr!("agents.hide_subagents") } else { tr!("agents.include_subagents") })
+                        .on_click(cx.listener(|palette, _, _, cx| palette.toggle_subagents(cx)))),
             )
             .child(list)
             // footer — the palette is new chrome; name the keys once, quietly.
@@ -964,6 +991,35 @@ pub fn layer(palette: Entity<CommandPalette>) -> impl IntoElement {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[gpui::test]
+    fn subagents_are_excluded_from_recent_and_search_until_explicitly_included(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| cx.set_global(Theme::for_id(theme::ThemeId::Orbit)));
+        let main = SessionInfo {
+            path: "main.jsonl".into(), id: "main".into(), cwd: "/work/game".into(),
+            title: "Main conversation".into(), first_message: "task".into(), modified: UNIX_EPOCH,
+            subagent: None,
+        };
+        let child = SessionInfo { path: "child.jsonl".into(), title: "scout child".into(),
+            subagent: Some(crate::session_origin::SubagentOrigin { parent: main.path.clone(), kind: "scout".into() }),
+            ..main.clone()
+        };
+        let palette = cx.new(|cx| CommandPalette::new(PaletteSnapshot {
+            sessions: vec![child, main], active_path: None, busy: false, session_id: None,
+            sidebar_visible: true, side_panel_visible: false, terminal_visible: false,
+            project_panel_visible: false, can_choose_model: false, can_choose_thinking: false,
+        }, Box::new(|_, _, _| {}), Box::new(|_, _, _| {}), Box::new(|_, _, _| {}), cx));
+        palette.update(cx, |palette, cx| {
+            assert_eq!(palette.session_items().len(), 1);
+            assert_eq!(palette.results("").iter().filter(|r| r.section == Section::Sessions).count(), 1);
+            assert!(!palette.results("scout").iter().any(|r| r.section == Section::Sessions));
+            palette.toggle_subagents(cx);
+            assert_eq!(palette.session_items().len(), 2);
+            assert!(palette.results("scout").iter().any(|r| r.section == Section::Sessions));
+            palette.toggle_subagents(cx);
+            assert_eq!(palette.session_items().len(), 1);
+        });
+    }
 
     #[test]
     fn fuzzy_subsequence_and_boundaries() {

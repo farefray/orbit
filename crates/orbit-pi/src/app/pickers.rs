@@ -17,7 +17,7 @@ impl OrbitApp {
                 last_active: None,
             });
         }
-        for session in &self.sessions {
+        for session in self.sessions.iter().filter(|s| s.subagent.is_none()) {
             if entries.len() >= crate::workspace_picker::MAX_RECENTS {
                 break;
             }
@@ -288,7 +288,7 @@ impl OrbitApp {
             }
         }
         if self.command_palette.take().is_some() {
-            self.input.read(cx).focus(window);
+            self.focus_session_surface(window, cx);
             cx.notify();
             return;
         }
@@ -300,17 +300,19 @@ impl OrbitApp {
         self.session_menu = None;
         self.workspace_menu = None;
 
+        let inspecting = self.agent_history.is_some();
         let snapshot = PaletteSnapshot {
             sessions: self.sidebar_sessions(),
-            active_path: self.current_session_path.clone(),
-            busy: self.busy || self.transcript.is_streaming(),
-            session_id: self.session_id.clone(),
+            active_path: self.agent_history.as_ref().map(|view| view.read(cx).path().to_path_buf())
+                .or_else(|| self.current_session_path.clone()),
+            busy: !inspecting && (self.busy || self.transcript.is_streaming()),
+            session_id: self.session_id.clone().filter(|_| !inspecting),
             sidebar_visible: self.sidebar_visible,
             side_panel_visible: self.sidepane.read(cx).is_open(),
             terminal_visible: self.terminal_panel.read(cx).is_open(),
             project_panel_visible: self.project_panel.read(cx).is_open(),
-            can_choose_model: !self.available_models.is_empty(),
-            can_choose_thinking: !self.available_thinking_levels.is_empty(),
+            can_choose_model: !inspecting && !self.available_models.is_empty(),
+            can_choose_thinking: !inspecting && !self.available_thinking_levels.is_empty(),
         };
 
         let this = cx.weak_entity();
@@ -340,9 +342,8 @@ impl OrbitApp {
                     app.menu_dismissed_at = Some(Instant::now());
                 }
                 app.command_palette = None;
-                // The palette's focus handle dies with it; hand focus back to
-                // the composer so typing continues after Escape.
-                app.input.read(cx).focus(window);
+                // Restore the visible surface, never the hidden parent composer.
+                app.focus_session_surface(window, cx);
                 cx.notify();
             })
             .ok();
@@ -365,6 +366,11 @@ impl OrbitApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if matches!(command, PaletteCommand::FocusComposer | PaletteCommand::ToggleSidePanel
+            | PaletteCommand::ToggleTerminal | PaletteCommand::ToggleProjectPanel | PaletteCommand::ReviewChanges) {
+            self.agent_history = None;
+        }
+        self.focus_session_surface(window, cx);
         match command {
             PaletteCommand::NewSession => self.on_new_session(&crate::NewSession, window, cx),
             PaletteCommand::RefreshSessions => self.on_refresh(&crate::RefreshSessions, window, cx),

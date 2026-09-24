@@ -395,6 +395,8 @@ pub struct OrbitApp {
     /// [`SIDEBAR_GROUP_SESSIONS_VISIBLE`], so a long history grows ten rows
     /// at a time instead of landing all at once.
     expanded_session_groups: HashMap<String, usize>,
+    expanded_subagent_groups: HashSet<PathBuf>,
+    agent_history: Option<Entity<crate::agent_history::AgentHistory>>,
     /// The projects Orbit lists in its sidebar — its own, user-curated folder
     /// list. pi owns the session files; this only records which folders the
     /// user added, persisted to `~/.orbit-pi/workspaces.json`. A workspace is
@@ -1039,6 +1041,8 @@ impl OrbitApp {
             collapsed_workspaces: HashSet::new(),
             expanded_workspace_groups: HashSet::new(),
             expanded_session_groups: HashMap::new(),
+            expanded_subagent_groups: HashSet::new(),
+            agent_history: None,
             workspaces: load_workspaces(),
             workspace_menu: None,
             current_session_path: None,
@@ -1436,6 +1440,8 @@ enum SideRow {
     },
     /// Session row — index into the (newest-first) sessions list.
     Session(usize),
+    ChildSession(usize),
+    Subagents { key: PathBuf, orphan: bool, count: usize, expanded: bool },
     /// Reveal the next batch of hidden sessions in a workspace group
     /// (`count` = the step size, at most one
     /// [`SIDEBAR_GROUP_SESSIONS_VISIBLE`]). `can_collapse` adds the
@@ -1891,6 +1897,8 @@ mod error_label_tests;
 mod popup_layout_tests;
 #[cfg(test)]
 mod sidebar_active_reveal_tests;
+#[cfg(test)]
+mod sidebar_subagent_tests;
 #[cfg(test)]
 mod sidebar_placeholder_tests;
 #[cfg(test)]

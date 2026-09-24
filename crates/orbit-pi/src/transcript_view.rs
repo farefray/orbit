@@ -166,6 +166,7 @@ pub(crate) struct TranscriptView {
     pub expanded_activities: ExpandedActivities,
     /// Per-tool detail-card open state, keyed `(message_ix, tool_ix)`.
     pub expanded_tools: ExpandedTools,
+    pub agent_selection: crate::agents::AgentSelection,
     pub copied: Rc<RefCell<HashMap<usize, Instant>>>,
     /// Per detail-section copy feedback, keyed `(message_ix, tool_ix, section)`.
     pub copied_sections: CopiedSections,
@@ -934,6 +935,7 @@ struct RowPaint {
     copied_at: Rc<RefCell<HashMap<usize, Instant>>>,
     scroller: MessageScrollerState,
     expanded_tools: ExpandedTools,
+    agent_selection: crate::agents::AgentSelection,
     copied_sections: CopiedSections,
     expanded_sections: ExpandedSections,
     expanded_blocks: ExpandedBlocks,
@@ -972,6 +974,7 @@ pub(crate) fn render_transcript(view: TranscriptView, cx: &gpui::App) -> impl In
     let expanded_files = view.expanded_files.clone();
     let expanded_activities = view.expanded_activities.clone();
     let expanded_tools = view.expanded_tools.clone();
+    let agent_selection = view.agent_selection.clone();
     let copied = view.copied.clone();
     let copied_sections = view.copied_sections.clone();
     let expanded_sections = view.expanded_sections.clone();
@@ -1157,6 +1160,7 @@ pub(crate) fn render_transcript(view: TranscriptView, cx: &gpui::App) -> impl In
             copied_at: copied.clone(),
             scroller: scroller.clone(),
             expanded_tools: expanded_tools.clone(),
+            agent_selection: agent_selection.clone(),
             copied_sections: copied_sections.clone(),
             expanded_sections: expanded_sections.clone(),
             expanded_blocks: expanded_blocks.clone(),
@@ -1831,6 +1835,7 @@ fn render_assistant(message: &ChatMessage, paint: &RowPaint) -> impl IntoElement
                         theme,
                         paint.expanded_activities.clone(),
                         paint.expanded_tools.clone(),
+                        paint.agent_selection.clone(),
                         paint.copied_sections.clone(),
                         paint.expanded_sections.clone(),
                         paint.scroller.clone(),
@@ -1899,6 +1904,7 @@ fn render_assistant(message: &ChatMessage, paint: &RowPaint) -> impl IntoElement
                 theme,
                 paint.expanded_activities.clone(),
                 paint.expanded_tools.clone(),
+                paint.agent_selection.clone(),
                 paint.copied_sections.clone(),
                 paint.expanded_sections.clone(),
                 paint.scroller.clone(),
@@ -2116,6 +2122,7 @@ fn render_activity_group(
     theme: Theme,
     expanded_activities: ExpandedActivities,
     expanded_tools: ExpandedTools,
+    agent_selection: crate::agents::AgentSelection,
     copied_sections: CopiedSections,
     expanded_sections: ExpandedSections,
     scroller: MessageScrollerState,
@@ -2291,6 +2298,7 @@ fn render_activity_group(
                     (ix, flat),
                     expanded_tools.borrow().contains(&(ix, flat)),
                     expanded_tools.clone(),
+                    agent_selection.clone(),
                     copied_sections.clone(),
                     expanded_sections.clone(),
                     scroller.clone(),
@@ -2845,6 +2853,7 @@ fn render_activity_card(
     key: (usize, usize),
     tool_open: bool,
     expanded_tools: ExpandedTools,
+    agent_selection: crate::agents::AgentSelection,
     copied_sections: CopiedSections,
     expanded_sections: ExpandedSections,
     scroller: MessageScrollerState,
@@ -2856,12 +2865,22 @@ fn render_activity_card(
     {
         return render_ask_card(tool, theme, key);
     }
-    let action = activity_action_label(&tool.name);
-    let detail = activity_preview(tool);
+    let agent = tool.facts.agent.as_ref();
+    let action = agent
+        .map(|a| a.name.clone())
+        .unwrap_or_else(|| activity_action_label(&tool.name));
+    let detail = agent
+        .map(|a| a.activity.as_ref().unwrap_or(&a.description).clone())
+        .unwrap_or_else(|| activity_preview(tool));
+    // A background spawn returning is not a child completing. For agent cards,
+    // lifecycle comes from the extension, not the generic last-tool heuristic.
+    let pulse = pulse && agent.is_none();
+    let complete = agent.map_or(complete, |a| a.status == "completed");
+    let failed = tool.failed || agent.is_some_and(|a| a.status == "error");
     let icon = activity_icon(&tool.name);
     // The glyph tone: strong state color while the call runs or once it
     // failed; otherwise the work kind's soft tint (see `work_tint`).
-    let tone = if tool.failed {
+    let tone = if failed {
         theme.del_red
     } else if pulse {
         theme.accent
@@ -2968,10 +2987,10 @@ fn render_activity_card(
                         theme,
                     ))
                 })
-                .when(tool.failed, |row| {
+                .when(failed, |row| {
                     row.child(glyph("icons/stop.svg", 12., theme.del_red))
                 })
-                .when(complete && !tool.failed, |row| {
+                .when(complete && !failed, |row| {
                     row.child(glyph("icons/check.svg", 11., theme.text_3))
                 })
                 .when_some(diff.clone(), |row, rows| {
@@ -3031,6 +3050,14 @@ fn render_activity_card(
                     },
                 )),
         );
+    if let Some(agent) = agent {
+        card = card.child(crate::agents::summary_row(
+            agent,
+            key,
+            agent_selection,
+            theme,
+        ));
+    }
     // A failed run carries its first error line right on the card — the
     // fact a user scanning the turn needs, without opening the detail.
     if tool.failed {
@@ -6996,6 +7023,7 @@ mod tests {
                 truncated: true,
                 output_lines: Some(1172),
                 total_lines: Some(1303),
+                ..ToolFacts::default()
             })
             .as_deref(),
             Some("truncated · 1172/1303")
@@ -7799,6 +7827,7 @@ mod tests {
             expanded_files: Rc::new(RefCell::new(HashSet::new())),
             expanded_activities: Rc::new(RefCell::new(HashMap::new())),
             expanded_tools: Rc::new(RefCell::new(HashSet::new())),
+            agent_selection: Rc::new(Cell::new(None)),
             copied: Rc::new(RefCell::new(HashMap::new())),
             copied_sections: Rc::new(RefCell::new(HashMap::new())),
             expanded_sections: Rc::new(RefCell::new(HashSet::new())),

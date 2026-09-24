@@ -74,6 +74,9 @@ impl OrbitApp {
     }
 
     pub(super) fn submit_as(&mut self, text: String, mode: SendMode, cx: &mut Context<Self>) {
+        if self.agent_history.is_some() {
+            return;
+        }
         let text = text.trim().to_string();
         if text.is_empty() {
             return;
@@ -383,11 +386,16 @@ impl OrbitApp {
             return;
         }
         if self.command_palette.take().is_some() {
-            self.input.read(cx).focus(window);
+            self.focus_session_surface(window, cx);
             cx.notify();
             return;
         }
         if self.workspace_picker.take().is_some() {
+            self.focus_session_surface(window, cx);
+            cx.notify();
+            return;
+        }
+        if self.agent_history.take().is_some() {
             self.input.read(cx).focus(window);
             cx.notify();
             return;
@@ -466,6 +474,10 @@ impl OrbitApp {
                 .update(cx, |pane, cx| pane.close_source_menu(cx));
             return;
         }
+        if self.transcript.agent_selection.take().is_some() {
+            cx.notify();
+            return;
+        }
         // Interactive Esc: drop the pending queue first so its text can be
         // restored to the composer when the `clear_queue` response lands
         // (docs), then abort the run.
@@ -492,6 +504,7 @@ impl OrbitApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.agent_history = None;
         // A run in flight must not be sacrificed to start a new task. pi's
         // `new_session` replaces the session and calls `abort()` on the live
         // turn (`agent-session-runtime.teardownCurrent`), which surfaces as
@@ -527,6 +540,7 @@ impl OrbitApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.agent_history = None;
         // Same workspace with an idle process: reuse it in place. A run in
         // flight is parked instead, so `new_session` never aborts it; a
         // different workspace always needs its own process anyway.
@@ -551,6 +565,7 @@ impl OrbitApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.agent_history = None;
         // Leaving this session: cancel any open blocking dialog first, so a
         // parked run never waits on a modal tied to the previous session.
         self.cancel_open_dialog(cx);
@@ -651,6 +666,17 @@ impl OrbitApp {
         push: bool,
         cx: &mut Context<Self>,
     ) {
+        let session = self.sessions.iter()
+            .find(|s| s.path == session.path && s.subagent.is_some())
+            .cloned()
+            .unwrap_or(session);
+        if session.subagent.is_some() {
+            self.open_agent_history(session, cx);
+            return;
+        }
+        if self.agent_history.take().is_some() {
+            cx.notify();
+        }
         // Opening a session means viewing the chat: leave whichever full-page
         // surface (GitHub / Usage) was covering the main area. Without this
         // the switch happens out of sight and the page stays up, so clicking
@@ -781,6 +807,43 @@ impl OrbitApp {
         .detach();
     }
 
+    pub(super) fn focus_session_surface(&self, window: &mut Window, cx: &App) {
+        if let Some(history) = &self.agent_history {
+            history.read(cx).focus(window);
+        } else {
+            self.input.read(cx).focus(window);
+        }
+    }
+
+    fn open_agent_history(&mut self, session: SessionInfo, cx: &mut Context<Self>) {
+        self.close_search(cx);
+        self.autocomplete_dismissed = true;
+        self.add_menu_open = false;
+        self.access_menu_open = false;
+        self.session_details_open = false;
+        self.quota_popup_open = false;
+        self.settings_open = false;
+        self.git_open = false;
+        self.usage_open = false;
+        self.file_viewer.update(cx, |viewer, cx| viewer.hide(cx));
+        let app = cx.weak_entity();
+        self.agent_history = Some(cx.new(|cx| {
+            crate::agent_history::AgentHistory::new(
+                session,
+                Box::new(move |window, cx| {
+                    app.update(cx, |app, cx| {
+                        app.agent_history = None;
+                        app.input.read(cx).focus(window);
+                        cx.notify();
+                    })
+                    .ok();
+                }),
+                cx,
+            )
+        }));
+        cx.notify();
+    }
+
     pub(super) fn on_open_session(&mut self, session: SessionInfo, cx: &mut Context<Self>) {
         self.switch_to_session(session, true, cx);
     }
@@ -788,9 +851,14 @@ impl OrbitApp {
     pub(super) fn on_history_back(
         &mut self,
         _: &MouseUpEvent,
-        _: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.agent_history.take().is_some() {
+            self.input.read(cx).focus(window);
+            cx.notify();
+            return;
+        }
         if self.history_index > 0 {
             self.history_index -= 1;
             if let Some(session) = self.session_history.get(self.history_index).cloned() {
@@ -1809,6 +1877,7 @@ impl OrbitApp {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.transcript.agent_selection.set(None);
         self.sidepane.update(cx, |pane, cx| pane.toggle(cx));
         cx.notify();
     }
@@ -1858,6 +1927,7 @@ impl OrbitApp {
     }
 
     pub(super) fn toggle_project_panel(&mut self, cx: &mut Context<Self>) {
+        self.transcript.agent_selection.set(None);
         let opening = !self.project_panel.read(cx).is_open();
         self.project_panel.update(cx, |panel, cx| panel.toggle(cx));
         if opening {
@@ -2082,6 +2152,7 @@ impl OrbitApp {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.transcript.agent_selection.set(None);
         self.sidepane
             .update(cx, |pane, cx| pane.show_uncommitted(cx));
         cx.notify();
@@ -2094,7 +2165,9 @@ impl OrbitApp {
     pub(super) fn review_opener(&self, _: &Context<Self>) -> crate::transcript_view::ReviewOpener {
         let pane = self.sidepane.clone();
         let latest = self.latest_turn;
+        let agent_selection = self.transcript.agent_selection.clone();
         Rc::new(move |_window, cx| {
+            agent_selection.set(None);
             pane.update(cx, |pane, cx| pane.show_review_turn(latest, cx));
         })
     }

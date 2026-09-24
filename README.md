@@ -39,6 +39,7 @@ Usage — requests, tokens, cost, and cache, read from your own sessions:
 - GFM markdown and syntax-highlighted code; highlighting is paint-only so streaming code blocks never reflow, and Mermaid fences stay copyable code blocks
 - In-transcript find (⌘F) and a full-window image lightbox
 - Tool activity — bash, edit, read, and thinking rows drawn natively, expanding into Arguments/Output cards with per-section copy
+- [Subagent inspection](crates/orbit-pi/docs/agents.md) — native progress cards and inspector; collapsed child-session families keep Recent focused on main sessions, with opt-in child search and read-only saved transcripts
 
 **Sessions**
 

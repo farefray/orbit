@@ -118,6 +118,7 @@ pub(crate) fn sessions_with_placeholder(
             title,
             first_message,
             modified: SystemTime::now(),
+            subagent: None,
         },
     );
     rows
@@ -161,6 +162,7 @@ pub(crate) fn build_sidebar_rows(
     // Attach each session to its project; a folder that is not listed simply
     // finds no group and stays out of the sidebar.
     for (ix, session) in sessions.iter().enumerate() {
+        if session.subagent.is_some() { continue; }
         let label = sessions::workspace_label(&session.cwd);
         if let Some((_, _, ixs)) = groups.iter_mut().find(|(l, _, _)| *l == label) {
             ixs.push(ix);
@@ -229,6 +231,63 @@ pub(crate) fn build_sidebar_rows(
         }
     }
     side_rows
+}
+
+/// Add child disclosures without changing main-session counts, limits or order.
+/// Descendants share their main ancestor's group; missing parents get an
+/// explicit orphan group in their own workspace, never silently disappear.
+pub(crate) fn with_subagent_rows(
+    rows: Vec<SideRow>,
+    sessions: &[SessionInfo],
+    expanded: &HashSet<PathBuf>,
+) -> Vec<SideRow> {
+    let roots = crate::session_origin::family_roots(sessions);
+    let mut children: HashMap<usize, Vec<usize>> = HashMap::new();
+    let mut orphans: HashMap<String, Vec<usize>> = HashMap::new();
+    for (ix, session) in sessions
+        .iter()
+        .enumerate()
+        .filter(|(_, s)| s.subagent.is_some())
+    {
+        if let Some(root) = roots[ix] {
+            children.entry(root).or_default().push(ix);
+        } else {
+            orphans
+                .entry(sessions::workspace_label(&session.cwd))
+                .or_default()
+                .push(ix);
+        }
+    }
+    let mut out = Vec::new();
+    let mut workspace_collapsed = false;
+    for row in rows {
+        if let SideRow::Workspace { collapsed, .. } = &row {
+            workspace_collapsed = *collapsed;
+        }
+        let group = match &row {
+            SideRow::Session(ix) if !workspace_collapsed => children
+                .remove(ix)
+                .map(|items| (sessions[*ix].path.clone(), false, items)),
+            SideRow::Workspace { label, cwd, collapsed: false, .. } => {
+                orphans.remove(label).map(|items| (cwd.clone(), true, items))
+            }
+            _ => None,
+        };
+        out.push(row);
+        if let Some((key, orphan, items)) = group {
+            let open = expanded.contains(&key);
+            out.push(SideRow::Subagents {
+                key,
+                orphan,
+                count: items.len(),
+                expanded: open,
+            });
+            if open {
+                out.extend(items.into_iter().map(SideRow::ChildSession));
+            }
+        }
+    }
+    out
 }
 
 /// The active workspace's header pinned over the session list, plus how far
@@ -300,6 +359,7 @@ pub(crate) fn render_side_row(
     rows: &Rc<Vec<SideRow>>,
     sessions_data: &Rc<Vec<SessionInfo>>,
     active_path: Option<&Path>,
+    preview_path: Option<&Path>,
     ix: usize,
     this: &Entity<OrbitApp>,
     agent_running: bool,
@@ -562,25 +622,60 @@ pub(crate) fn render_side_row(
                 )
                 .into_any_element()
         }
-        SideRow::Session(ix) => {
+        SideRow::Subagents { key, orphan, count, expanded } => {
+            let key = key.clone();
+            let this = this.clone();
+            div()
+                .id(ElementId::NamedInteger("subagent-group".into(), ix as u64))
+                .w_full()
+                .pl(px(34.))
+                .pr(px(8.))
+                .py(px(5.))
+                .flex()
+                .items_center()
+                .gap(px(6.))
+                .cursor_pointer()
+                .text_size(theme.ui_px(11.))
+                .text_color(theme.text_3)
+                .when(cursor, |el| el.bg(theme.overlay))
+                .hover(|s| s.bg(theme.bg_hover))
+                .child(icon(
+                    if *expanded { "icons/chevron-down.svg" } else { "icons/chevron-right.svg" },
+                    11.,
+                    theme.text_3,
+                ))
+                .child(if *orphan {
+                    tr!("agents.orphan_group", count = count)
+                } else {
+                    tr!("agents.session_group", count = count)
+                })
+                .on_mouse_up(MouseButton::Left, move |_, _, cx| {
+                    this.update(cx, |app, cx| app.toggle_subagent_group(key.clone(), cx));
+                })
+                .into_any_element()
+        }
+        SideRow::Session(ix) | SideRow::ChildSession(ix) => {
             let session = sessions_data[*ix].clone();
+            let child = session.subagent.is_some();
             let session_for_click = session.clone();
             let active = active_path == Some(session.path.as_path());
+            let selected = preview_path.map_or(active, |path| path == session.path);
             // The open session runs live; parked (background) sessions run
             // in their own pi processes — both get the loader.
-            let running = (active && agent_running) || running_paths.contains(&session.path);
-            let pinned = pinned_paths.contains(&session.path);
+            let running =
+                !child && ((active && agent_running) || running_paths.contains(&session.path));
+            let pinned = !child && pinned_paths.contains(&session.path);
             let this = this.clone();
             let this_for_row = this.clone();
             let this_for_menu = this.clone();
             let menu = session_menu.filter(|m| m.path == session.path);
             // Sessions with a live pi process (running or warm) must not be
             // deleted — the process would recreate the file mid-run.
-            let deletable = !active && !running && !live_paths.contains(&session.path);
+            let deletable = !child && !active && !running && !live_paths.contains(&session.path);
             // Running sessions lead with a small spinner and a shimmering
             // title (shadcn's Marker + `shimmer`); row actions stay available
             // on hover.
-            let title = session_title(*ix, session.title.clone().into(), theme, active, running);
+            let title = session_title(*ix, session.title.clone().into(), theme, selected, running);
             // Indented under its workspace group so the list reads as a
             // tree. The open session takes the `active` fill with `active_fg`
             // ink — the same selected-destination grammar as the nav rows;
@@ -605,6 +700,7 @@ pub(crate) fn render_side_row(
                     let this = this.clone();
                     move |event: &MouseDownEvent, window, cx| {
                         cx.stop_propagation();
+                        if child { return; }
                         this.update(cx, |app, cx| {
                             app.open_session_menu_at(
                                 SessionMenu {
@@ -633,16 +729,16 @@ pub(crate) fn render_side_row(
             let mut card = div()
                 .group("srow")
                 .w_full()
-                .pl(px(22.))
+                .pl(px(if child { 48. } else { 22. }))
                 .pr(px(8.))
                 .py(theme.space(5.))
                 .rounded_md()
                 .flex()
                 .items_center()
                 .gap(px(6.))
-                .when(active, |card| card.bg(theme.active))
-                .when(cursor && !active, |card| card.bg(theme.overlay))
-                .when(!active && !cursor, |card| card.hover(|s| s.bg(theme.bg_hover)));
+                .when(selected, |card| card.bg(theme.active))
+                .when(cursor && !selected, |card| card.bg(theme.overlay))
+                .when(!selected && !cursor, |card| card.hover(|s| s.bg(theme.bg_hover)));
             // Text column: title + actions, then the first-message preview
             // with the age. Every row with a message keeps the same two-line
             // shape — even when the title repeats it — so the list scans
@@ -681,8 +777,9 @@ pub(crate) fn render_side_row(
                             .when(pinned, |line| {
                                 line.child(icon("icons/pin.svg", 16., theme.text_3))
                             })
+                            .when(child, |line| line.child(icon("icons/tools/task.svg", 14., theme.text_3)))
                             .child(title)
-                            .child(session_menu_button(
+                            .when(!child, |line| line.child(session_menu_button(
                                 *ix,
                                 menu,
                                 session.path.clone(),
@@ -690,7 +787,7 @@ pub(crate) fn render_side_row(
                                 deletable,
                                 this_for_menu,
                                 theme,
-                            ))
+                            )))
                             .when(!show_preview, |line| {
                                 line.child(
                                     div()
@@ -1510,7 +1607,7 @@ impl OrbitApp {
             .filter(|(_, parked)| parked.busy)
             .map(|(path, _)| path.clone())
             .collect();
-        build_sidebar_rows(
+        with_subagent_rows(build_sidebar_rows(
             &sessions,
             &self.workspaces,
             &working,
@@ -1520,7 +1617,14 @@ impl OrbitApp {
             &pinned,
             &self.current_session_path,
             &running,
-        )
+        ), &sessions, &self.expanded_subagent_groups)
+    }
+
+    pub(super) fn toggle_subagent_group(&mut self, key: PathBuf, cx: &mut Context<Self>) {
+        if !self.expanded_subagent_groups.remove(&key) {
+            self.expanded_subagent_groups.insert(key);
+        }
+        self.clamp_sidebar_cursor(cx);
     }
 
     /// Row index of the open session in `rows`, when it is visible.
@@ -1619,7 +1723,8 @@ impl OrbitApp {
             return;
         };
         match row {
-            SideRow::Session(ix) => {
+            SideRow::Subagents { key, .. } => self.toggle_subagent_group(key.clone(), cx),
+            SideRow::Session(ix) | SideRow::ChildSession(ix) => {
                 let sessions = self.sidebar_sessions();
                 if let Some(session) = sessions.get(*ix).cloned() {
                     self.on_open_session(session, cx);
@@ -1667,7 +1772,7 @@ impl OrbitApp {
             return;
         }
         self.sidebar_cursor = None;
-        self.input.read(cx).focus(window);
+        self.focus_session_surface(window, cx);
         cx.notify();
     }
 

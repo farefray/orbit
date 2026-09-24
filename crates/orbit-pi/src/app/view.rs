@@ -127,7 +127,7 @@ impl Render for OrbitApp {
                 .map(|(path, _)| path.clone())
                 .collect(),
         );
-        let side_rows = Rc::new(build_sidebar_rows(
+        let side_rows = Rc::new(with_subagent_rows(build_sidebar_rows(
             &sidebar_sessions,
             &self.workspaces,
             &working_label,
@@ -137,13 +137,14 @@ impl Render for OrbitApp {
             &pinned,
             &self.current_session_path,
             &running_paths,
-        ));
+        ), &sidebar_sessions, &self.expanded_subagent_groups));
         let old = self.sidebar_list.item_count();
         if old != side_rows.len() {
             self.sidebar_list.splice(0..old, side_rows.len());
         }
         let sessions_data = Rc::new(sidebar_sessions);
         let active_path = Rc::new(self.current_session_path.clone());
+        let preview_path = self.agent_history.as_ref().map(|view| view.read(cx).path().to_path_buf());
         let session_menu = Rc::new(self.session_menu.clone());
         let workspace_menu = Rc::new(self.workspace_menu.clone());
         let sidebar_cursor = self.sidebar_cursor;
@@ -172,6 +173,7 @@ impl Render for OrbitApp {
                     &side_rows,
                     &sessions_data,
                     active_path.as_deref(),
+                    preview_path.as_deref(),
                     sticky.ix,
                     &this,
                     agent_running,
@@ -200,8 +202,35 @@ impl Render for OrbitApp {
         let viewport = window.viewport_size();
         // The right side pane is hidden while settings/onboarding own the
         // main area (same rule as the sessions sidebar).
+        let agent_width = crate::agents::inspector_width(
+            viewport.width
+                - if self.sidebar_visible {
+                    self.sidebar_width
+                } else {
+                    px(0.)
+                },
+        );
+        let agent_inspector = if self.agent_history.is_none() && !self.settings_open
+            && !self.usage_open
+            && !self.git_open
+            && !self.file_viewer.read(cx).is_open()
+            && self.dependencies_ready()
+        {
+            self.transcript.render_agent_inspector(agent_width, theme)
+        } else {
+            None
+        };
+        let agent_visible = agent_inspector.is_some();
+        if agent_visible {
+            // Right docks are mutually exclusive. Close, rather than merely
+            // hide, so the next Review/Explorer toggle opens what it advertises.
+            self.sidepane.update(cx, |pane, cx| pane.close(cx));
+            self.project_panel.update(cx, |panel, cx| panel.close(cx));
+        }
         let pane_open = self.sidepane.read(cx).is_open();
         let pane_visible = pane_open
+            && self.agent_history.is_none()
+            && !agent_visible
             && !self.settings_open
             && !self.usage_open
             && self.dependencies_ready();
@@ -220,6 +249,7 @@ impl Render for OrbitApp {
         // full-page surfaces (settings / Git / Usage) hide it by construction;
         // `terminal_visible` exists to stop a hidden shell requesting frames.
         let terminal_visible = self.terminal_panel.read(cx).is_open()
+            && self.agent_history.is_none()
             && !self.settings_open
             && !self.usage_open
             && !self.git_open;
@@ -239,6 +269,9 @@ impl Render for OrbitApp {
         // Leading inset the full-window pages (Git/Usage/Files) give their
         // headers while the sidebar is collapsed.
         let page_leading = view::page_header_leading(self.sidebar_visible);
+        if let Some(history) = &self.agent_history {
+            history.update(cx, |history, _| history.header_leading = page_leading);
+        }
         self.git_panel.update(cx, |panel, cx| {
             panel.set_context(git_workspace, git_provider, git_model, cx);
             panel.set_chrome_leading(page_leading, cx);
@@ -261,8 +294,10 @@ impl Render for OrbitApp {
         // pane are mutually exclusive right docks: while Review is open the
         // tree stays closed.
         let explorer_visible = self.project_panel.read(cx).is_open()
+            && self.agent_history.is_none()
             && !self.settings_open
-            && !pane_open;
+            && !pane_open
+            && !agent_visible;
         let explorer_width = if explorer_visible {
             self.project_panel.read(cx).width()
         } else {
@@ -295,7 +330,8 @@ impl Render for OrbitApp {
                 px(0.)
             }
             - explorer_width
-            - pane_width;
+            - pane_width
+            - if agent_visible { agent_width } else { px(0.) };
         // Composer toolbar compaction: below this column width the access
         // pill drops out and the model label clamps (Send stays reachable).
         let composer_compact = (main_width - px(32.)).min(px(CONTENT_MAX_W)) < px(600.);
@@ -635,6 +671,7 @@ impl Render for OrbitApp {
                                                                     &side_rows,
                                                                     &sessions_data,
                                                                     active_path.as_deref(),
+                                                                    preview_path.as_deref(),
                                                                     ix,
                                                                     &this,
                                                                     agent_running,
@@ -764,6 +801,8 @@ impl Render for OrbitApp {
                 // Usage reads pi's store from disk, so it stays available even
                 // when the runtime itself is missing.
                 self.usage.clone().into_any_element()
+            } else if let Some(history) = &self.agent_history {
+                history.clone().into_any_element()
             } else if !self.dependencies_ready() {
                 // Missing runtime pieces (pi / node): show the setup page
                 // with install commands instead of the empty composer.
@@ -809,6 +848,7 @@ impl Render for OrbitApp {
                                 if platform::draws_window_controls()
                                     && !pane_visible
                                     && !explorer_visible
+                                    && !agent_visible
                                 {
                                     platform::WINDOW_CONTROLS_W
                                 } else {
@@ -1031,6 +1071,7 @@ impl Render for OrbitApp {
             .children(explorer_visible.then(|| self.project_panel.clone().into_any_element()))
             // ── right side pane (Review) ──
             .children(pane_visible.then(|| self.sidepane.clone().into_any_element()))
+            .children(agent_inspector)
             // ── titlebar controls ── a fixed overlay pinned just past the
             // macOS traffic lights, above both the sidebar and the main column.
             // Shown on every surface except Settings, which owns its own nav
@@ -2774,7 +2815,7 @@ impl OrbitApp {
         theme: Theme,
         cx: &Context<Self>,
     ) -> impl IntoElement + use<> {
-        let back_enabled = self.history_index > 0;
+        let back_enabled = self.agent_history.is_some() || self.history_index > 0;
         let forward_enabled = self.history_index + 1 < self.session_history.len();
         // The three controls wear the same glass chips as the right cluster
         // ([`header_icon_button`]), so the whole 44px bar reads as one row:

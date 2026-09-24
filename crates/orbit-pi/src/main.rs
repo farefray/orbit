@@ -37,6 +37,9 @@ macro_rules! tr_cow {
 }
 
 mod access;
+mod agents;
+mod agent_history;
+mod session_origin;
 mod app;
 mod app_icon;
 mod ask;

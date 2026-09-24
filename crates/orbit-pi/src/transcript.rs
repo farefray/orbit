@@ -114,6 +114,8 @@ pub struct TurnSummary {
 /// absent — the UI never invents a count or a status.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct ToolFacts {
+    /// pi-subagents metadata, retained through stream updates and session reloads.
+    pub(crate) agent: Option<Box<crate::agents::AgentDetails>>,
     /// The result was capped (read/bash `truncation`, grep match limit, ls
     /// entry limit): the agent saw only part of the data.
     pub truncated: bool,
@@ -132,6 +134,7 @@ impl ToolFacts {
         let Some(details) = value.get("details").filter(|details| !details.is_null()) else {
             return facts;
         };
+        facts.agent = crate::agents::AgentDetails::from_details(details).map(Box::new);
         // read/bash attach a `truncation` object only when the output was cut;
         // it carries the line budget the agent actually saw.
         if let Some(truncation) = details.get("truncation").filter(|t| !t.is_null()) {
@@ -149,6 +152,24 @@ impl ToolFacts {
             }
         }
         facts
+    }
+
+    /// A thrown/aborted tool may end without extension details. Keep identity
+    /// and usage for inspection, but never leave the old running state alive.
+    fn with_previous_agent(mut self, previous: &Self, failed: bool) -> Self {
+        if self.agent.is_none() {
+            self.agent = previous.agent.clone().map(|mut agent| {
+                if failed {
+                    agent.status = "error".into();
+                } else if matches!(agent.status.as_str(), "running" | "queued") {
+                    agent.status = "unknown".into();
+                }
+                agent.live = false;
+                agent.activity = None;
+                agent
+            });
+        }
+        self
     }
 }
 
@@ -775,6 +796,7 @@ pub(crate) fn dismiss_rail_hint_state(
 
 /// Transcript state shared between the view and the RPC event pump.
 pub struct Transcript {
+    pub(crate) agent_selection: crate::agents::AgentSelection,
     messages: Rc<RefCell<Vec<ChatMessage>>>,
     /// Cross-block text selection + right-click copy menu state.
     text_selection: transcript_view::TextSelectionState,
@@ -851,6 +873,7 @@ impl Transcript {
     pub fn new() -> Self {
         let messages = Rc::new(RefCell::new(Vec::new()));
         Self {
+            agent_selection: Rc::new(Cell::new(None)),
             messages,
             text_selection: Rc::new(RefCell::new(transcript_view::TextSelection::new())),
             scroller: MessageScrollerState::new(0),
@@ -891,6 +914,7 @@ impl Transcript {
 
     /// Rebuild the whole transcript from a `get_messages` response payload.
     pub fn load_from(&mut self, data: &Value) {
+        self.agent_selection.set(None);
         self.text_selection.borrow_mut().clear();
         let mut parsed = Vec::new();
         if let Some(messages) = data.get("messages").and_then(Value::as_array) {
@@ -952,6 +976,7 @@ impl Transcript {
 
     /// Clear for a fresh session.
     pub fn clear(&mut self) {
+        self.agent_selection.set(None);
         *self.messages.borrow_mut() = Vec::new();
         self.text_selection.borrow_mut().clear();
         self.scroller.reset(0);
@@ -1492,7 +1517,7 @@ impl Transcript {
                             tool.output = output;
                         }
                         tool.failed = failed;
-                        tool.facts = facts;
+                        tool.facts = facts.with_previous_agent(&tool.facts, failed);
                         before != (tool.output.clone(), tool.failed, tool.facts.clone())
                     }
                     None => false,
@@ -1519,7 +1544,7 @@ impl Transcript {
                 tool.output = output;
             }
             tool.failed = failed;
-            tool.facts = facts;
+            tool.facts = facts.with_previous_agent(&tool.facts, failed);
             return before != (tool.output.clone(), tool.failed, tool.facts.clone());
         }
         false
@@ -1552,12 +1577,15 @@ impl Transcript {
                     .get("result")
                     .or_else(|| value.get("partialResult"));
                 let before = (tool.output.clone(), tool.failed, tool.facts.clone());
-                tool.facts = result.map(ToolFacts::from_result).unwrap_or_default();
-                tool.output = result.map(normalize_tool_result);
                 tool.failed = value
                     .get("isError")
                     .and_then(Value::as_bool)
                     .unwrap_or(false);
+                tool.facts = result
+                    .map(ToolFacts::from_result)
+                    .unwrap_or_default()
+                    .with_previous_agent(&tool.facts, tool.failed);
+                tool.output = result.map(normalize_tool_result);
                 before != (tool.output.clone(), tool.failed, tool.facts.clone())
             };
             if changed {
@@ -1659,7 +1687,10 @@ impl Transcript {
             return false;
         };
         let output = normalize_tool_result(partial);
-        let facts = ToolFacts::from_result(partial);
+        let mut facts = ToolFacts::from_result(partial);
+        if let Some(agent) = &mut facts.agent {
+            agent.live = true;
+        }
         let mut messages = self.messages.borrow_mut();
         let Some(message) = messages.get_mut(mix) else {
             return false;
@@ -1683,11 +1714,12 @@ impl Transcript {
         if tool.output.as_ref() == Some(&output) && tool.facts == facts {
             return false;
         }
+        let agent_card_changed = tool.facts.agent.is_some() != facts.agent.is_some();
         tool.output = Some(output);
         tool.facts = facts;
         let detail_open = self.expanded_tools.borrow().contains(&(mix, flat_ix));
         drop(messages);
-        if detail_open {
+        if detail_open || agent_card_changed {
             self.remeasure_row(mix);
         }
         true
@@ -1968,6 +2000,15 @@ impl Transcript {
     /// Drop live streaming state so the working indicator and stop
     /// affordances clear even if a message end was missed.
     fn clear_live_state(&mut self) {
+        // An interrupted run may never deliver tool_execution_end. Its last
+        // observations remain inspectable, but are no longer live claims.
+        for message in self.messages.borrow_mut().iter_mut() {
+            for tool in message.steps.iter_mut().flat_map(|step| &mut step.tools) {
+                if let Some(agent) = &mut tool.facts.agent {
+                    agent.live = false;
+                }
+            }
+        }
         self.streaming.set(None);
         self.step_mark.set(None);
         self.stream_started.set(None);
@@ -2052,6 +2093,19 @@ impl Transcript {
         true
     }
 
+    /// Read the selected tool directly from this session's transcript; inspection
+    /// never starts another pi process or consumes a subagent result.
+    pub(crate) fn render_agent_inspector(
+        &self,
+        width: Pixels,
+        theme: crate::theme::Theme,
+    ) -> Option<gpui::AnyElement> {
+        let (message, tool) = self.agent_selection.get()?;
+        let messages = self.messages.borrow();
+        let tool = messages.get(message)?.tools().nth(tool)?;
+        crate::agents::inspector(tool, self.agent_selection.clone(), width, theme)
+    }
+
     /// Render into the chat panel — rail + centered 760px column. The
     /// workspace roots the changed-files Review git diff; the viewport
     /// height caps the rail, and the main-area width gates its visibility.
@@ -2099,6 +2153,7 @@ impl Transcript {
                 expanded_files: self.expanded_files.clone(),
                 expanded_activities: self.expanded_activities.clone(),
                 expanded_tools: self.expanded_tools.clone(),
+                agent_selection: self.agent_selection.clone(),
                 copied: self.copied.clone(),
                 copied_sections: self.copied_sections.clone(),
                 expanded_sections: self.expanded_sections.clone(),
@@ -2127,6 +2182,10 @@ impl Transcript {
         )
     }
 }
+
+#[cfg(test)]
+#[path = "agents_transcript_tests.rs"]
+mod agent_tests;
 
 #[cfg(test)]
 mod tests {

@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Native pi-subagents progress cards and a read-only right-side agent inspector,
+  preserving reported metadata across streaming updates and session reloads
+- Collapsed subagent session families, main-only recent sessions and project counts,
+  opt-in child-session search, and disk-only read-only child transcript browsing
+
 ## [0.0.16] - 2026-09-24
 
 ### Added
