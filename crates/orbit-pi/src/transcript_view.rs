@@ -1089,6 +1089,7 @@ struct RowPaint {
     thinking_detached: ThinkingDetached,
     hovered_usage: Rc<Cell<Option<usize>>>,
     image_opener: Option<ImageOpener>,
+    workspace: Option<PathBuf>,
     search_hit: bool,
     search_active: bool,
     /// Tables alone can extend beyond the centered message column.
@@ -1315,6 +1316,7 @@ pub(crate) fn render_transcript(view: TranscriptView, cx: &gpui::App) -> impl In
             thinking_detached: thinking_detached.clone(),
             hovered_usage: hovered_usage.clone(),
             image_opener: image_opener.clone(),
+            workspace: workspace.clone(),
             search_hit: search_hits
                 .as_ref()
                 .is_some_and(|hits| hits.borrow().contains(&ix)),
@@ -1896,6 +1898,7 @@ fn render_user_bubble(message: &ChatMessage, paint: &RowPaint) -> impl IntoEleme
                         true,
                         paint.scroller.clone(),
                         None,
+                        paint.workspace.as_deref(),
                     )),
             )
         })
@@ -2021,6 +2024,7 @@ fn render_assistant(message: &ChatMessage, paint: &RowPaint) -> impl IntoElement
                 !paint.live,
                 paint.scroller.clone(),
                 Some(paint.table_breakout),
+                paint.workspace.as_deref(),
             )));
         }
 
@@ -5477,6 +5481,7 @@ fn render_prose(
     collapsible: bool,
     scroller: MessageScrollerState,
     table_breakout: Option<TableBreakout>,
+    workspace: Option<&Path>,
 ) -> impl IntoElement + use<> {
     let blocks = parse_blocks_cached(text);
     let gaps: Vec<f32> = blocks
@@ -5526,6 +5531,7 @@ fn render_prose(
                         expanded_blocks.clone(),
                         collapsible,
                         scroller.clone(),
+                        workspace,
                     ))
             })
             .collect::<Vec<_>>(),
@@ -5550,6 +5556,7 @@ pub(crate) fn render_markdown_document(text: &str, theme: Theme) -> impl IntoEle
         expanded,
         false,
         MessageScrollerState::new(1),
+        None,
         None,
     )
 }
@@ -5587,6 +5594,7 @@ fn render_block(
     expanded_blocks: ExpandedBlocks,
     collapsible: bool,
     scroller: MessageScrollerState,
+    workspace: Option<&Path>,
 ) -> AnyElement {
     match block {
         Block::Paragraph(lines) => paragraph_text(
@@ -5679,9 +5687,27 @@ fn render_block(
             aligns,
         } => render_table(header, rows, aligns, ix, salt, block_ix, theme).into_any_element(),
         Block::Image { alt, url } => {
-            render_markdown_image(alt, url, ix, salt, block_ix, theme).into_any_element()
+            render_markdown_image(alt, url, ix, salt, block_ix, theme, workspace).into_any_element()
         }
     }
+}
+
+/// Resolve local Markdown destinations against the session, not Orbit's cwd
+/// or its embedded UI assets. Remote URLs retain GPUI's async HTTP loader.
+fn markdown_image_source(destination: &str, workspace: Option<&Path>) -> ImageSource {
+    let path = Path::new(destination);
+    if path.is_absolute() {
+        return path.to_path_buf().into();
+    }
+    if let Ok(url) = url::Url::parse(destination) {
+        if let Ok(path) = url.to_file_path() {
+            return path.into();
+        }
+        return destination.to_string().into();
+    }
+    workspace
+        .map_or_else(|| path.to_path_buf(), |root| root.join(path))
+        .into()
 }
 
 /// A block-level image. Remote sources (the GitHub issue screenshots) load
@@ -5695,31 +5721,47 @@ fn render_markdown_image(
     salt: u64,
     block_ix: usize,
     theme: Theme,
+    workspace: Option<&Path>,
 ) -> impl IntoElement {
+    let source = markdown_image_source(url, workspace);
+    let open = source.clone();
     let url = url.to_string();
-    let open = url.clone();
-    let fallback_alt = alt.to_string();
     div().w_full().min_w_0().flex().child(
-        img(url)
-            .id(md_id(ix, salt, block_ix, 0))
-            // `min_w_0` is load-bearing: a replaced element's automatic minimum
-            // width is its intrinsic width, so without it `max_w_full` loses
-            // and a large screenshot overflows the column and the rail.
-            .min_w_0()
-            .max_w_full()
-            // Height 0 lets taffy derive the box from the image's aspect ratio
-            // once it decodes, so the image scales to the column instead of
-            // keeping its intrinsic height and leaving a tall empty band (gpui
-            // seeds `size.height` with the intrinsic value otherwise).
-            .h(px(0.))
-            .rounded(px(8.))
-            .border_1()
-            .border_color(theme.border)
-            .object_fit(ObjectFit::Contain)
-            .cursor_pointer()
-            .with_fallback(move || markdown_image_fallback(&fallback_alt, theme))
-            .on_click(move |_, _, cx| cx.open_url(&open)),
+        markdown_image_element(source, alt, md_id(ix, salt, block_ix, 0), theme)
+            .on_click(move |_, _, cx| match &open {
+                ImageSource::Resource(gpui::Resource::Path(path)) => {
+                    crate::platform::open_path_default(path);
+                }
+                _ => cx.open_url(&url),
+            }),
     )
+}
+
+fn markdown_image_element(
+    source: ImageSource,
+    alt: &str,
+    id: ElementId,
+    theme: Theme,
+) -> gpui::Stateful<gpui::Img> {
+    let fallback_alt = alt.to_string();
+    img(source)
+        .id(id)
+        // `min_w_0` is load-bearing: a replaced element's automatic minimum
+        // width is its intrinsic width, so without it `max_w_full` loses
+        // and a large screenshot overflows the column and the rail.
+        .min_w_0()
+        .max_w_full()
+        // In this auto-height parent a percentage resolves to auto. Unlike
+        // h_auto(), it prevents GPUI from seeding a fixed intrinsic height;
+        // unlike h(0), it lets both aspect ratio and fallback content size
+        // the box, keeping the following paragraph below it.
+        .h(gpui::relative(1.))
+        .rounded(px(8.))
+        .border_1()
+        .border_color(theme.border)
+        .object_fit(ObjectFit::Contain)
+        .cursor_pointer()
+        .with_fallback(move || markdown_image_fallback(&fallback_alt, theme))
 }
 
 /// The fallback shown when a markdown image cannot load: the alt text when it
@@ -8052,6 +8094,125 @@ mod tests {
                 0,
                 theme::Theme::for_id(theme::ThemeId::Orbit),
             ))
+        }
+    }
+
+    #[test]
+    fn markdown_image_resolves_project_relative_path() {
+        let root = Path::new("/projects/thegame");
+        let destination = "bin/qa/harness/attack-pair.png";
+        let ImageSource::Resource(gpui::Resource::Path(path)) =
+            markdown_image_source(destination, Some(root))
+        else {
+            panic!("local image must not be an embedded asset or HTTP resource");
+        };
+        assert_eq!(path.as_ref(), root.join(destination));
+    }
+
+    #[test]
+    fn markdown_image_preserves_remote_url() {
+        let url = "https://example.com/preview.png";
+        assert!(matches!(
+            markdown_image_source(url, Some(Path::new("/project"))),
+            ImageSource::Resource(gpui::Resource::Uri(_))
+        ));
+    }
+
+    #[test]
+    fn markdown_image_resolves_file_url() {
+        let path = std::env::temp_dir().join("preview with spaces.png");
+        let url = url::Url::from_file_path(&path).unwrap();
+        let ImageSource::Resource(gpui::Resource::Path(resolved)) =
+            markdown_image_source(url.as_str(), None)
+        else {
+            panic!("file URL must use the local file loader");
+        };
+        assert_eq!(resolved.as_ref(), path);
+    }
+
+    struct MarkdownImageTestView {
+        source: ImageSource,
+    }
+
+    impl gpui::Render for MarkdownImageTestView {
+        fn render(&mut self, _: &mut Window, _: &mut gpui::Context<Self>) -> impl IntoElement {
+            let theme = theme::Theme::for_id(theme::ThemeId::Orbit);
+            div()
+                .w_full()
+                .flex()
+                .flex_col()
+                .child(
+                    div()
+                        .id("image-box")
+                        .debug_selector(|| "image-box".into())
+                        .w_full()
+                        .min_w_0()
+                        .flex()
+                        .child(markdown_image_element(
+                            self.source.clone(),
+                            "Ready → замах → завершення удару",
+                            "test-image".into(),
+                            theme,
+                        )),
+                )
+                .child(
+                    div()
+                        .id("after-image")
+                        .debug_selector(|| "after-image".into())
+                        .mt(px(14.))
+                        .child("Ще не фінальні"),
+                )
+        }
+    }
+
+    #[gpui::test]
+    fn markdown_image_fallback_reserves_height(cx: &mut gpui::TestAppContext) {
+        let cx = cx.add_empty_window();
+        let view = cx.update(|_, cx| {
+            cx.new(|_| MarkdownImageTestView {
+                source: ImageSource::from(|_: &mut Window, _: &mut gpui::App| {
+                    Some(Err(gpui::ImageCacheError::Asset("missing image".into())))
+                }),
+            })
+        });
+        cx.draw(
+            point(px(0.), px(0.)),
+            gpui::size(px(300.), px(1000.)),
+            |_, _| view.clone(),
+        );
+        let image = cx.debug_bounds("image-box").unwrap();
+        let after = cx.debug_bounds("after-image").unwrap();
+        assert!(
+            image.size.height >= px(30.),
+            "fallback must not collapse: {image:?}"
+        );
+        assert!(after.top() >= image.bottom() + px(14.));
+    }
+
+    #[gpui::test]
+    fn markdown_image_scales_without_collapsing_or_overflowing(cx: &mut gpui::TestAppContext) {
+        let cx = cx.add_empty_window();
+        let image = Arc::new(gpui::RenderImage::new(vec![image::Frame::new(
+            image::RgbaImage::new(1200, 600),
+        )]));
+        let view = cx.update(|_, cx| {
+            cx.new(|_| MarkdownImageTestView {
+                source: image.into(),
+            })
+        });
+        for width in [300., 600.] {
+            cx.draw(
+                point(px(0.), px(0.)),
+                gpui::size(px(width), px(1000.)),
+                |_, _| view.clone(),
+            );
+            let image = cx.debug_bounds("image-box").unwrap();
+            let after = cx.debug_bounds("after-image").unwrap();
+            assert!(
+                (f32::from(image.size.height) - width / 2.).abs() < 3.,
+                "aspect ratio: {image:?}"
+            );
+            assert!(after.top() >= image.bottom() + px(14.));
         }
     }
 
