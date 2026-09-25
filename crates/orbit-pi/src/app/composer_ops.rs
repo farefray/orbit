@@ -236,7 +236,7 @@ impl OrbitApp {
                             .child(
                                 div()
                                     .flex_none()
-                                    .max_w(px(CONTENT_MAX_W / 2.))
+                                    .max_w(px(theme.ui.chat_width.max_width() / 2.))
                                     .truncate()
                                     .text_size(theme.ui_px(12.))
                                     .font_weight(FontWeight::MEDIUM)
@@ -278,7 +278,7 @@ impl OrbitApp {
         }
         // Full width of the chat box, so long paths are never cut.
         let popup = div()
-            .w(px(CONTENT_MAX_W))
+            .w(px(theme.ui.chat_width.max_width()))
             .font_family(theme::ui_font_family())
             .rounded(px(10.))
             .popover_surface(theme)

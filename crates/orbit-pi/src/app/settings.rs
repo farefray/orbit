@@ -4931,6 +4931,13 @@ impl OrbitApp {
                     ),
                     self.setting_row(
                         theme,
+                        &tr!("settings.chat_width"),
+                        Some(&tr!("settings.chat_width_description")),
+                        None,
+                        Some(self.chat_width_select(theme, this.clone(), cx)),
+                    ),
+                    self.setting_row(
+                        theme,
                         &tr!("settings.reduce_motion"),
                         Some(&tr!(
                             "settings.stop_looping_animations_spinners_and_the_running"
@@ -5526,6 +5533,7 @@ impl OrbitApp {
                 "%",
             ),
             SettingsSelect::Language
+            | SettingsSelect::ChatWidth
             | SettingsSelect::Theme(_)
             | SettingsSelect::UiFontFamily
             | SettingsSelect::CodeFontFamily
@@ -5552,6 +5560,34 @@ impl OrbitApp {
                 .iter()
                 .map(|v| format!("{} {}", *v as u32, suffix))
                 .collect(),
+            selected,
+            theme,
+            this,
+            cx,
+        )
+    }
+
+    fn chat_width_select(
+        &self,
+        theme: Theme,
+        this: Entity<OrbitApp>,
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        use crate::theme::ChatWidth;
+        let labels = [
+            tr!("settings.chat_width_normal"),
+            tr!("settings.chat_width_wide"),
+            tr!("settings.chat_width_wider"),
+        ];
+        let selected = ChatWidth::ALL
+            .iter()
+            .position(|width| *width == theme.ui.chat_width)
+            .unwrap_or(0);
+        self.select_control(
+            "chat-width-select",
+            SettingsSelect::ChatWidth,
+            labels[selected].clone(),
+            labels.to_vec(),
             selected,
             theme,
             this,
@@ -6039,6 +6075,12 @@ impl OrbitApp {
             }
             SettingsSelect::SpacingDensity => {
                 ui.spacing_density = SPACING_DENSITIES.get(ix).copied().unwrap_or(100);
+            }
+            SettingsSelect::ChatWidth => {
+                let Some(width) = theme::ChatWidth::ALL.get(ix).copied() else {
+                    return;
+                };
+                ui.chat_width = width;
             }
             SettingsSelect::Theme(_)
             | SettingsSelect::UiFontFamily

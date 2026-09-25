@@ -62,11 +62,10 @@ pub(crate) type ImageOpener = Rc<dyn Fn(Arc<Image>, &mut Window, &mut App)>;
 /// Stages the quoted selection and its comment in the app's composer.
 pub(crate) type QuoteSubmitter = Rc<dyn Fn(String, &mut Window, &mut App)>;
 
-/// The transcript content column's max width.
-/// Normal message content keeps this centered measure. Assistant tables
-/// break out to the transcript pane's width; their scroll viewport must not
-/// inherit this cap.
-const CONTENT_MAX_WIDTH: f32 = 960.0;
+// Default measure used by layout regression tests; the live measure comes
+// from the chat width preference. Tables can still break out of that measure.
+#[cfg(test)]
+const CONTENT_MAX_WIDTH: f32 = crate::theme::ChatWidth::Normal.max_width();
 /// Extra space before a follow-up user message.
 const FOLLOWUP_TURN_TOP_GAP: f32 = 32.0;
 /// User-bubble max width.
@@ -1105,6 +1104,7 @@ fn suppress_message_footer(has_summary: bool, ix: usize, row_count: usize) -> bo
 
 pub(crate) fn render_transcript(view: TranscriptView, cx: &gpui::App) -> impl IntoElement + use<> {
     let theme = *theme::get(cx);
+    let content_max_width = theme.ui.chat_width.max_width();
     let messages = view.messages.clone();
     let text_selection = view.text_selection.clone();
     text_selection.borrow_mut().begin_frame();
@@ -1170,7 +1170,7 @@ pub(crate) fn render_transcript(view: TranscriptView, cx: &gpui::App) -> impl In
     // Reserve the rail's gutter only from spare space outside the normal
     // text strip, so expanding a table never makes it narrower than prose.
     let table_inset = if show_rail {
-        ((view.main_width - px(40. + CONTENT_MAX_WIDTH)) / 2.).clamp(
+        ((view.main_width - px(40. + content_max_width)) / 2.).clamp(
             px(0.),
             px(NAVIGATION_RAIL_LEFT + NAVIGATION_RAIL_WIDTH + NAVIGATION_RAIL_CONTENT_GAP - 20.),
         )
@@ -1178,7 +1178,7 @@ pub(crate) fn render_transcript(view: TranscriptView, cx: &gpui::App) -> impl In
         px(0.)
     };
     let available_width = (view.main_width - px(40.)).max(px(0.));
-    let column_width = available_width.min(px(CONTENT_MAX_WIDTH));
+    let column_width = available_width.min(px(content_max_width));
     let table_breakout = TableBreakout {
         max_width: (available_width - table_inset * 2.).max(column_width),
         column_width,
@@ -1281,7 +1281,7 @@ pub(crate) fn render_transcript(view: TranscriptView, cx: &gpui::App) -> impl In
                 .child(
                     div()
                         .w_full()
-                        .max_w(px(CONTENT_MAX_WIDTH))
+                        .max_w(px(content_max_width))
                         .min_w_0()
                         .flex()
                         .flex_col()
@@ -8267,6 +8267,67 @@ mod tests {
                 "activity bodies must remain hidden at streaming stage {stage}"
             );
         }
+    }
+
+    #[gpui::test]
+    fn chat_width_pref_changes_transcript_measure_and_clamps_to_pane(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let cx = cx.add_empty_window();
+        let state = Rc::new(RefCell::new(TextSelection::new()));
+        let messages = test_messages();
+        let prose = "A wide conversation should use the selected measure.".repeat(12);
+        messages.borrow_mut()[0].steps[0].text = prose.clone();
+        let scroller = MessageScrollerState::new(messages.borrow().len());
+        let view = cx.update(|_, cx| {
+            cx.new(|_| SelectTestView {
+                messages: messages.clone(),
+                state: state.clone(),
+                scroller,
+                main_width: px(2000.),
+                open_work: false,
+                live: false,
+            })
+        });
+        for (width, max_width) in [
+            (theme::ChatWidth::Normal, 960.),
+            (theme::ChatWidth::Wide, 1280.),
+            (theme::ChatWidth::Wider, 1600.),
+        ] {
+            cx.update(|_, cx| {
+                let mut theme = theme::Theme::for_id(theme::ThemeId::Orbit);
+                theme.ui.chat_width = width;
+                cx.set_global(theme);
+            });
+            cx.draw(point(px(0.), px(0.)), gpui::size(px(2000.), px(1000.)), |_, _| {
+                view.clone()
+            });
+            let selection = state.borrow();
+            let paragraph = selection
+                .blocks
+                .iter()
+                .find(|block| block.text.as_ref() == prose)
+                .unwrap();
+            assert_eq!(paragraph.bounds.size.width, px(max_width));
+        }
+        cx.update(|_, cx| {
+            view.update(cx, |view, cx| {
+                view.main_width = px(900.);
+                cx.notify();
+            })
+        });
+        cx.draw(
+            point(px(0.), px(0.)),
+            gpui::size(px(900.), px(1000.)),
+            |_, _| view.clone(),
+        );
+        let selection = state.borrow();
+        let paragraph = selection
+            .blocks
+            .iter()
+            .find(|block| block.text.as_ref() == prose)
+            .unwrap();
+        assert_eq!(paragraph.bounds.size.width, px(860.));
     }
 
     #[gpui::test]

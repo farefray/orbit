@@ -98,7 +98,8 @@ impl Render for DragGhost {
         div()
     }
 }
-const CONTENT_MAX_W: f32 = 960.;
+// Settings cards keep the normal measure; chat uses the selected width.
+const CONTENT_MAX_W: f32 = theme::ChatWidth::Normal.max_width();
 
 /// Rows shown in the `/`-command and `@`-file autocomplete menu.
 const AUTOCOMPLETE_LIMIT: usize = 8;
@@ -1879,6 +1880,7 @@ enum SettingsSelect {
     TerminalFont,
     EditorFont,
     SpacingDensity,
+    ChatWidth,
     UiFontFamily,
     CodeFontFamily,
     BackdropBlur,

@@ -405,6 +405,39 @@ impl Global for Theme {}
 /// `Language` name stays stable for the settings surface.
 pub use crate::i18n::AppLanguage as Language;
 
+/// Maximum width of the chat transcript and composer, in logical pixels.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ChatWidth {
+    #[default]
+    Normal,
+    Wide,
+    Wider,
+}
+
+impl ChatWidth {
+    pub const ALL: [Self; 3] = [Self::Normal, Self::Wide, Self::Wider];
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Normal => "normal",
+            Self::Wide => "wide",
+            Self::Wider => "wider",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|width| width.as_str() == value)
+    }
+
+    pub const fn max_width(self) -> f32 {
+        match self {
+            Self::Normal => 960.,
+            Self::Wide => 1280.,
+            Self::Wider => 1600.,
+        }
+    }
+}
+
 /// General-settings customization: language, type sizes, and density.
 /// Every size is px with the built-in defaults (UI 14, terminal / editor 13);
 /// only spacing density remains a percentage.
@@ -419,6 +452,8 @@ pub struct UiPrefs {
     pub editor_font_size: f32,
     /// Global spacing multiplier, percent ("Spacing Density").
     pub spacing_density: u32,
+    /// Maximum chat content width (transcript + composer).
+    pub chat_width: ChatWidth,
     /// Honor reduce-motion: perpetual/looping animations (spinners, the
     /// running-session shimmer, the drop-overlay fade) render static.
     pub reduce_motion: bool,
@@ -440,6 +475,7 @@ impl Default for UiPrefs {
             terminal_font_size: 13.,
             editor_font_size: 13.,
             spacing_density: 100,
+            chat_width: ChatWidth::Normal,
             reduce_motion: false,
         }
     }
@@ -510,6 +546,13 @@ impl UiPrefs {
                 prefs.spacing_density = density;
             }
         }
+        if let Some(width) = value
+            .get("chat_width")
+            .and_then(Value::as_str)
+            .and_then(ChatWidth::parse)
+        {
+            prefs.chat_width = width;
+        }
         if let Some(reduce) = value.get("reduce_motion").and_then(Value::as_bool) {
             prefs.reduce_motion = reduce;
         }
@@ -529,6 +572,7 @@ impl UiPrefs {
                 "terminal_font_size": self.terminal_font_size,
                 "editor_font_size": self.editor_font_size,
                 "spacing_density": self.spacing_density,
+                "chat_width": self.chat_width.as_str(),
                 "reduce_motion": self.reduce_motion,
             })
             .to_string(),
@@ -3281,6 +3325,26 @@ mod tests {
         }));
         assert_eq!(legacy.ui_font_size, 16.);
         assert_eq!(legacy.editor_font_size, 15.);
+    }
+
+    #[test]
+    fn chat_width_pref_parses_valid_values_and_defaults_on_unknown() {
+        use serde_json::json;
+        for (value, expected) in [
+            ("normal", ChatWidth::Normal),
+            ("wide", ChatWidth::Wide),
+            ("wider", ChatWidth::Wider),
+            ("unknown", ChatWidth::Normal),
+        ] {
+            assert_eq!(
+                UiPrefs::from_value(&json!({"chat_width": value})).chat_width,
+                expected
+            );
+        }
+        assert_eq!(
+            UiPrefs::from_value(&json!({})).chat_width,
+            ChatWidth::Normal
+        );
     }
 
     #[test]

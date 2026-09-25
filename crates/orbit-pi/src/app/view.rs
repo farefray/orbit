@@ -334,7 +334,8 @@ impl Render for OrbitApp {
             - if agent_visible { agent_width } else { px(0.) };
         // Composer toolbar compaction: below this column width the access
         // pill drops out and the model label clamps (Send stays reachable).
-        let composer_compact = (main_width - px(32.)).min(px(CONTENT_MAX_W)) < px(600.);
+        let chat_max_width = theme.ui.chat_width.max_width();
+        let composer_compact = (main_width - px(32.)).min(px(chat_max_width)) < px(600.);
         // The Usage page lays itself out against the real main-area width, so
         // its tables and grids never overflow the column it is given.
         if self.usage_open {
@@ -951,7 +952,7 @@ impl Render for OrbitApp {
                                     // re-keying when a sibling appears, so
                                     // their animations never restart mid-way.
                                     .id("composer-column")
-                                    .max_w(px(CONTENT_MAX_W))
+                                    .max_w(px(chat_max_width))
                                     .w_full()
                                     .flex()
                                     .flex_col()
